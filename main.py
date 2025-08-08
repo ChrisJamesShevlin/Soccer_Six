@@ -4,14 +4,25 @@ import threading, requests, re, json, math, time
 from collections import defaultdict
 
 # =========================
-# Bivariate Poisson helpers
+# Tunables
 # =========================
-DEF_EXP        = 0.90   # defence dampening exponent
+DEF_EXP        = 0.90   # defence dampening exponent on xGA
 FAV_BOOST      = 1.30   # favourite boost
 HOME_FAV_BOOST = 1.20   # extra if favourite is home
-RHO            = 0.5    # correlation term multiplier
-MAX_GOALS      = 6      # grid search limit for scoreline
+RHO            = 0.5    # bivariate Poisson correlation-ish
+MAX_GOALS      = 6
 
+# Player availability layer (FPL)
+USE_PLAYER_LAYER   = True
+ATK_TOP_N          = 5        # best MIDs/FWDs considered "core attackers"
+DEF_TOP_N          = 4        # best DEFs (plus GK) considered "core defenders"
+ATK_CLIP           = (0.85, 1.15)
+DEF_CLIP           = (0.90, 1.15)
+DEF_AVAIL_EXP      = 1.00     # >1 makes missing defenders hurt more
+
+# =========================
+# Bivariate Poisson helpers
+# =========================
 def bivariate_pmf(h, a, lam1, lam2, lam3):
     base = math.exp(-(lam1 + lam2 + lam3))
     tot = 0.0
@@ -61,7 +72,6 @@ def _extract_json_from_jsonparse(html: str, varname: str = "matchesData"):
     return json.loads(decoded)
 
 def _load_understat_matches(season="2024", retries: int = 3, backoff: float = 1.0):
-    """Return list of match dicts from Understat (EPL season)."""
     url = f"https://understat.com/league/EPL/{season}"
     s = requests.Session()
     s.headers.update(REQ_HEADERS)
@@ -78,7 +88,6 @@ def _load_understat_matches(season="2024", retries: int = 3, backoff: float = 1.
     raise RuntimeError(f"Couldn't locate Understat matchesData ({last_err})")
 
 def _team_timeseries_from_matches(matches):
-    """Build per-team chronological lists of xG for/against."""
     xg_for = defaultdict(list)
     xg_against = defaultdict(list)
     games_played = defaultdict(int)
@@ -109,7 +118,6 @@ def _ewma(seq, span=8):
     return val
 
 def build_current_ewma(season="2024", span=8):
-    """This season EWMA xG/xGA + games played per team."""
     matches = _load_understat_matches(season)
     xgf, xga, gp = _team_timeseries_from_matches(matches)
     ewma_xg  = {t: _ewma(lst, span=span) for t, lst in xgf.items()}
@@ -117,7 +125,6 @@ def build_current_ewma(season="2024", span=8):
     return ewma_xg, ewma_xga, gp
 
 def build_last_season_priors(prev_season="2023"):
-    """Priors from last season: simple mean xG/xGA per team + league means."""
     matches = _load_understat_matches(prev_season)
     xgf, xga, _ = _team_timeseries_from_matches(matches)
     prior_xg  = {t: (sum(lst)/len(lst) if lst else 0.0) for t, lst in xgf.items()}
@@ -127,11 +134,87 @@ def build_last_season_priors(prev_season="2023"):
     return prior_xg, prior_xga, league_prior_xg, league_prior_xga
 
 # =========================
-# FPL data (strength + fixtures)
+# FPL data (strength + fixtures + players)
 # =========================
+def _to_float(x): 
+    try: return float(x)
+    except: return 0.0
+
+def _expected_minutes(p):
+    """Rough expected minutes from FPL status + chance_of_playing_next_round."""
+    status = p.get("status", "a")
+    chance = p.get("chance_of_playing_next_round")
+    if status == "a":
+        if isinstance(chance, int): 
+            return int(90 * chance/100)
+        return 90
+    if status == "d":
+        if isinstance(chance, int):
+            return int(90 * chance/100)
+        return 30
+    return 0  # i/s/n/u -> not expected
+
+def _per90(val, minutes):
+    m = max(1, int(minutes or 0))
+    return _to_float(val) * 90.0 / m
+
+def build_player_availability_multipliers(elements, teams):
+    """
+    Returns:
+      attack_mult[name_lower] in [ATK_CLIP]
+      def_mult[name_lower]    in [DEF_CLIP]  (bigger = stronger defence available)
+    """
+    id2name = {t["id"]: t["name"].lower() for t in teams}
+    by_team = defaultdict(list)
+    for p in elements:
+        p = dict(p)  # shallow copy
+        p["team_name"] = id2name.get(p["team"], None)
+        if p["team_name"]:
+            by_team[p["team_name"]].append(p)
+
+    attack_mult = {}
+    def_mult = {}
+
+    for tname, plist in by_team.items():
+        # split by role
+        attackers = [p for p in plist if p["element_type"] in (3, 4)]  # MID/FWD
+        defenders = [p for p in plist if p["element_type"] in (2,)]    # DEF
+        gks       = [p for p in plist if p["element_type"] in (1,)]    # GK
+
+        # attacker metric: (threat + creativity) per90
+        for p in attackers:
+            p["_atk_p90"] = _per90(_to_float(p.get("threat", 0.0)) + _to_float(p.get("creativity", 0.0)), p.get("minutes", 0))
+            p["_exp_min"] = _expected_minutes(p)
+
+        # defender metric: influence per90
+        for p in defenders + gks:
+            p["_def_p90"] = _per90(_to_float(p.get("influence", 0.0)), p.get("minutes", 0))
+            p["_exp_min"] = _expected_minutes(p)
+
+        # ---- Attack availability
+        atk_sorted = sorted(attackers, key=lambda x: x.get("_atk_p90", 0.0), reverse=True)[:ATK_TOP_N]
+        base_atk = sum(p["_atk_p90"] * 90 for p in atk_sorted) or 1.0
+        cur_atk  = sum(p["_atk_p90"] * p["_exp_min"] for p in atk_sorted)
+        atk_ratio = cur_atk / base_atk
+        atk_ratio = max(ATK_CLIP[0], min(ATK_CLIP[1], atk_ratio))
+        attack_mult[tname] = atk_ratio
+
+        # ---- Defensive availability (GK + best DEF_TOP_N defenders)
+        gk_best = sorted(gks, key=lambda x: x.get("_def_p90", 0.0), reverse=True)[:1]
+        def_best = sorted(defenders, key=lambda x: x.get("_def_p90", 0.0), reverse=True)[:DEF_TOP_N]
+        core_def = gk_best + def_best
+        base_def = sum(p["_def_p90"] * 90 for p in core_def) or 1.0
+        cur_def  = sum(p["_def_p90"] * p["_exp_min"] for p in core_def)
+        def_ratio = (cur_def / base_def) ** DEF_AVAIL_EXP
+        def_ratio = max(DEF_CLIP[0], min(DEF_CLIP[1], def_ratio))
+        def_mult[tname] = def_ratio
+
+    return attack_mult, def_mult
+
 def fetch_fpl_data(gw):
     bs = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=20).json()
     teams    = bs["teams"]
+    elements = bs["elements"]
     fixtures = requests.get(f"https://fantasy.premierleague.com/api/fixtures/?event={gw}", timeout=20).json()
 
     id2name = {t["id"]: t["name"].lower() for t in teams}
@@ -146,7 +229,8 @@ def fetch_fpl_data(gw):
         if h and a:
             diff_map[(h, a)] = (f.get("team_h_difficulty",3), f.get("team_a_difficulty",3))
 
-    return team_str, avg_ah, avg_aa, diff_map
+    atk_mult, def_mult = build_player_availability_multipliers(elements, teams)
+    return team_str, avg_ah, avg_aa, diff_map, atk_mult, def_mult
 
 # =========================
 # GUI App
@@ -154,7 +238,7 @@ def fetch_fpl_data(gw):
 class ScorePredictApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Exact Score Predictor (priors + EWMA blend)")
+        self.title("Exact Score Predictor (priors + EWMA blend + FPL availability)")
         self.geometry("720x600")
 
         # Data containers
@@ -172,6 +256,10 @@ class ScorePredictApp(tk.Tk):
         self.team_str = {}
         self.avg_ah = self.avg_aa = 50.0
         self.diff_map = {}
+
+        # Player layer
+        self.atk_mult = defaultdict(lambda: 1.0)  # team_name_lower -> multiplier
+        self.def_mult = defaultdict(lambda: 1.0)
 
         self._build_ui()
         threading.Thread(target=self._load_data, daemon=True).start()
@@ -194,10 +282,10 @@ class ScorePredictApp(tk.Tk):
 
     def _load_data(self):
         try:
-            # FPL: current or next GW for fixture difficulty
+            # FPL: current or next GW for fixture difficulty + player layer
             evs = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=20).json()["events"]
             gw  = next((e["id"] for e in evs if e.get("is_current")), evs[0]["id"])
-            self.team_str, self.avg_ah, self.avg_aa, self.diff_map = fetch_fpl_data(gw + 1)
+            self.team_str, self.avg_ah, self.avg_aa, self.diff_map, self.atk_mult, self.def_mult = fetch_fpl_data(gw + 1)
 
             # Understat: current season EWMA (last 8) + games played
             self.curr_xg, self.curr_xga, self.gp = build_current_ewma(season="2024", span=8)
@@ -205,7 +293,7 @@ class ScorePredictApp(tk.Tk):
             # Understat: last season priors (means)
             self.prior_xg, self.prior_xga, self.league_prior_xg, self.league_prior_xga = build_last_season_priors(prev_season="2023")
 
-            # Build blended (per team): w = min(gp/8, 1)
+            # Blend (per team): w = min(gp/8, 1)
             all_teams = set(self.curr_xg) | set(self.prior_xg) | set(self.team_str.keys())
             for t in all_teams:
                 gp_t = self.gp.get(t, 0)
@@ -222,7 +310,8 @@ class ScorePredictApp(tk.Tk):
             # League avg of blended xGA (for defence normalisation)
             self.league_blend_xga = sum(self.blend_xga.values()) / max(1, len(self.blend_xga))
 
-            self.status.set("✅ Data loaded, ready to predict.")
+            layer = " + player availability" if USE_PLAYER_LAYER else ""
+            self.status.set(f"✅ Data loaded, ready to predict{layer}.")
         except Exception as e:
             self.status.set(f"❌ Load error: {e}")
 
@@ -246,13 +335,13 @@ class ScorePredictApp(tk.Tk):
             xga_h = self.blend_xga.get(home, self.league_prior_xga)
             xga_a = self.blend_xga.get(away, self.league_prior_xga)
 
-            # FPL strength (normalised to league avg)
+            # FPL team strength (normalised to league avg)
             th = self.team_str.get(h, {})
             ta = self.team_str.get(a, {})
             sa_h = th.get("strength_attack_home", self.avg_ah) / self.avg_ah
             sa_a = ta.get("strength_attack_away", self.avg_aa) / self.avg_aa
 
-            # Defence factors (lower xGA → better defence → smaller df)
+            # Defence factors from xGA (lower is better → reduces opponent λ)
             df_h_raw = xga_h / (self.league_blend_xga or 1.0)
             df_a_raw = xga_a / (self.league_blend_xga or 1.0)
             df_h = df_h_raw ** DEF_EXP
@@ -267,12 +356,22 @@ class ScorePredictApp(tk.Tk):
             lam1 = xg_h * sa_h * df_a * factor_h
             lam2 = xg_a * sa_a * df_h * factor_a
 
+            # ---- Player availability multipliers (attack & defence)
+            if USE_PLAYER_LAYER:
+                am_h = self.atk_mult.get(h, 1.0)
+                am_a = self.atk_mult.get(a, 1.0)
+                dm_h = self.def_mult.get(h, 1.0)  # bigger = stronger defence available
+                dm_a = self.def_mult.get(a, 1.0)
+
+                lam1 *= am_h * (1.0 / max(1e-6, dm_a))
+                lam2 *= am_a * (1.0 / max(1e-6, dm_h))
+
             # Favourite & home-favourite boosts at lambda-level
             if lam1 > lam2:
-                lam1 *= FAV_BOOST * HOME_FAV_BOOST   # favourite is home
-                lam2 *= FAV_BOOST                    # give the dog a small nudge too
+                lam1 *= FAV_BOOST * HOME_FAV_BOOST
+                lam2 *= FAV_BOOST
             else:
-                lam2 *= FAV_BOOST                    # away favourite
+                lam2 *= FAV_BOOST
 
             # Pick most likely exact score
             H, A = pick_scoreline(lam1, lam2, rho=RHO, max_goals=MAX_GOALS)
