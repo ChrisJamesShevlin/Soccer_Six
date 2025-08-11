@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
 import threading, requests, re, json, math, time
 from collections import defaultdict
 
@@ -20,6 +20,9 @@ ATK_CLIP           = (0.85, 1.15)
 DEF_CLIP           = (0.90, 1.15)
 DEF_AVAIL_EXP      = 1.00     # >1 makes missing defenders hurt more
 
+# Betting utilities
+DEFAULT_EXCH_COMM  = 0.02     # 2% exchange commission for fair-odds adj
+
 # =========================
 # Bivariate Poisson helpers
 # =========================
@@ -32,7 +35,7 @@ def bivariate_pmf(h, a, lam1, lam2, lam3):
         tot += num / den
     return base * tot
 
-def pick_scoreline(lam1, lam2, rho=RHO, max_goals=MAX_GOALS):
+def mode_and_prob(lam1, lam2, rho=RHO, max_goals=MAX_GOALS):
     lam3 = rho * min(lam1, lam2)
     best, best_p = (0, 0), 0.0
     for H in range(max_goals + 1):
@@ -40,7 +43,11 @@ def pick_scoreline(lam1, lam2, rho=RHO, max_goals=MAX_GOALS):
             p = bivariate_pmf(H, A, lam1, lam2, lam3)
             if p > best_p:
                 best, best_p = (H, A), p
-    return best
+    return best[0], best[1], best_p
+
+def min_odds_for_pos_ev_on_exchange(p, commission=DEFAULT_EXCH_COMM):
+    if p <= 0: return float('inf')
+    return 1.0 + (1.0/p - 1.0) / max(1e-6, (1.0 - commission))
 
 # =========================
 # Understat scraping (robust)
@@ -54,17 +61,12 @@ REQ_HEADERS = {
 }
 
 def _extract_json_from_jsonparse(html: str, varname: str = "matchesData"):
-    """
-    Extract JSON payload from: varname = JSON.parse('<js string>');
-    Handles escaped quotes and \\x/\\u sequences via double unicode_escape decode.
-    """
     pat = rf"{re.escape(varname)}\s*=\s*JSON\.parse\('(?P<blob>(?:\\.|[^'])*)'\)"
     m = re.search(pat, html, re.S)
     if not m:
         m = re.search(r"JSON\.parse\('(?P<blob>(?:\\.|[^'])*)'\)", html, re.S)
     if not m:
         raise RuntimeError("Couldn't locate Understat matchesData")
-
     js_blob = m.group("blob")
     decoded = js_blob.encode("utf-8").decode("unicode_escape")
     if "\\x" in decoded or "\\u" in decoded:
@@ -91,21 +93,17 @@ def _team_timeseries_from_matches(matches):
     xg_for = defaultdict(list)
     xg_against = defaultdict(list)
     games_played = defaultdict(int)
-
     for m in matches:
         home = m["h"]["title"]
         away = m["a"]["title"]
         xGh  = float(m["xG"]["h"])
         xGa  = float(m["xG"]["a"])
-
         xg_for[home].append(xGh)
         xg_against[home].append(xGa)
         games_played[home] += 1
-
         xg_for[away].append(xGa)
         xg_against[away].append(xGh)
         games_played[away] += 1
-
     return xg_for, xg_against, games_played
 
 def _ewma(seq, span=8):
@@ -141,7 +139,6 @@ def _to_float(x):
     except: return 0.0
 
 def _expected_minutes(p):
-    """Rough expected minutes from FPL status + chance_of_playing_next_round."""
     status = p.get("status", "a")
     chance = p.get("chance_of_playing_next_round")
     if status == "a":
@@ -152,63 +149,43 @@ def _expected_minutes(p):
         if isinstance(chance, int):
             return int(90 * chance/100)
         return 30
-    return 0  # i/s/n/u -> not expected
+    return 0  # i/s/n/u
 
 def _per90(val, minutes):
     m = max(1, int(minutes or 0))
     return _to_float(val) * 90.0 / m
 
 def build_player_availability_multipliers(elements, teams):
-    """
-    Returns:
-      attack_mult[name_lower] in [ATK_CLIP]
-      def_mult[name_lower]    in [DEF_CLIP]  (bigger = stronger defence available)
-    """
     id2name = {t["id"]: t["name"].lower() for t in teams}
     by_team = defaultdict(list)
     for p in elements:
-        p = dict(p)  # shallow copy
+        p = dict(p)
         p["team_name"] = id2name.get(p["team"], None)
         if p["team_name"]:
             by_team[p["team_name"]].append(p)
-
-    attack_mult = {}
-    def_mult = {}
-
+    attack_mult, def_mult = {}, {}
     for tname, plist in by_team.items():
-        # split by role
-        attackers = [p for p in plist if p["element_type"] in (3, 4)]  # MID/FWD
-        defenders = [p for p in plist if p["element_type"] in (2,)]    # DEF
-        gks       = [p for p in plist if p["element_type"] in (1,)]    # GK
-
-        # attacker metric: (threat + creativity) per90
+        attackers = [p for p in plist if p["element_type"] in (3, 4)]
+        defenders = [p for p in plist if p["element_type"] in (2,)]
+        gks       = [p for p in plist if p["element_type"] in (1,)]
         for p in attackers:
             p["_atk_p90"] = _per90(_to_float(p.get("threat", 0.0)) + _to_float(p.get("creativity", 0.0)), p.get("minutes", 0))
             p["_exp_min"] = _expected_minutes(p)
-
-        # defender metric: influence per90
         for p in defenders + gks:
             p["_def_p90"] = _per90(_to_float(p.get("influence", 0.0)), p.get("minutes", 0))
             p["_exp_min"] = _expected_minutes(p)
-
-        # ---- Attack availability
         atk_sorted = sorted(attackers, key=lambda x: x.get("_atk_p90", 0.0), reverse=True)[:ATK_TOP_N]
         base_atk = sum(p["_atk_p90"] * 90 for p in atk_sorted) or 1.0
         cur_atk  = sum(p["_atk_p90"] * p["_exp_min"] for p in atk_sorted)
-        atk_ratio = cur_atk / base_atk
-        atk_ratio = max(ATK_CLIP[0], min(ATK_CLIP[1], atk_ratio))
+        atk_ratio = max(ATK_CLIP[0], min(ATK_CLIP[1], cur_atk / base_atk))
         attack_mult[tname] = atk_ratio
-
-        # ---- Defensive availability (GK + best DEF_TOP_N defenders)
         gk_best = sorted(gks, key=lambda x: x.get("_def_p90", 0.0), reverse=True)[:1]
         def_best = sorted(defenders, key=lambda x: x.get("_def_p90", 0.0), reverse=True)[:DEF_TOP_N]
         core_def = gk_best + def_best
         base_def = sum(p["_def_p90"] * 90 for p in core_def) or 1.0
         cur_def  = sum(p["_def_p90"] * p["_exp_min"] for p in core_def)
-        def_ratio = (cur_def / base_def) ** DEF_AVAIL_EXP
-        def_ratio = max(DEF_CLIP[0], min(DEF_CLIP[1], def_ratio))
+        def_ratio = max(DEF_CLIP[0], min(DEF_CLIP[1], (cur_def / base_def) ** DEF_AVAIL_EXP))
         def_mult[tname] = def_ratio
-
     return attack_mult, def_mult
 
 def fetch_fpl_data(gw):
@@ -216,19 +193,16 @@ def fetch_fpl_data(gw):
     teams    = bs["teams"]
     elements = bs["elements"]
     fixtures = requests.get(f"https://fantasy.premierleague.com/api/fixtures/?event={gw}", timeout=20).json()
-
     id2name = {t["id"]: t["name"].lower() for t in teams}
     team_str = {t["name"].lower(): t for t in teams}
     avg_ah = sum(t["strength_attack_home"] for t in teams) / len(teams)
     avg_aa = sum(t["strength_attack_away"] for t in teams) / len(teams)
-
     diff_map = {}
     for f in fixtures:
         h = id2name.get(f["team_h"])
         a = id2name.get(f["team_a"])
         if h and a:
             diff_map[(h, a)] = (f.get("team_h_difficulty",3), f.get("team_a_difficulty",3))
-
     atk_mult, def_mult = build_player_availability_multipliers(elements, teams)
     return team_str, avg_ah, avg_aa, diff_map, atk_mult, def_mult
 
@@ -238,8 +212,8 @@ def fetch_fpl_data(gw):
 class ScorePredictApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Exact Score Predictor (priors + EWMA blend + FPL availability)")
-        self.geometry("720x600")
+        self.title("Exact Score Predictor (priors + EWMA + FPL availability + in-table odds)")
+        self.geometry("980x640")
 
         # Data containers
         self.curr_xg = {}
@@ -256,126 +230,231 @@ class ScorePredictApp(tk.Tk):
         self.team_str = {}
         self.avg_ah = self.avg_aa = 50.0
         self.diff_map = {}
-
-        # Player layer
-        self.atk_mult = defaultdict(lambda: 1.0)  # team_name_lower -> multiplier
+        self.atk_mult = defaultdict(lambda: 1.0)
         self.def_mult = defaultdict(lambda: 1.0)
 
+        # rows cache: item_id -> dict
+        self.rows = {}
         self._build_ui()
         threading.Thread(target=self._load_data, daemon=True).start()
 
     def _build_ui(self):
         frm = ttk.Frame(self); frm.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Label(frm, text="Fixtures (one per line, e.g. Arsenal vs Chelsea):").pack(anchor=tk.W)
+        ttk.Label(frm, text="Fixtures (one per line, e.g. 'Arsenal vs Chelsea'). Double-click a 'Market Odds' cell to enter a price.").pack(anchor=tk.W)
         self.text = tk.Text(frm, height=6); self.text.pack(fill=tk.X)
-        ttk.Button(frm, text="Predict Scores", command=self.on_predict).pack(pady=6)
+        ttk.Button(frm, text="Predict & Rank", command=self.on_predict).pack(pady=6)
 
-        cols = ["Fixture", "Predicted Score"]
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=12)
-        for c in cols:
+        cols = ["Fixture", "Predicted Score", "Model Prob %", "Fair Odds", "Fair O (exch 2%)", "Market Odds", "Edge %", "EV/£"]
+        self.cols = cols
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=14)
+        for c, w in zip(cols, [220, 120, 100, 100, 120, 100, 90, 80]):
             self.tree.heading(c, text=c)
-            self.tree.column(c, anchor=tk.CENTER, width=340)
+            self.tree.column(c, anchor=tk.CENTER, width=w)
         self.tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
 
         self.status = tk.StringVar(value="⏳ Loading data…")
         ttk.Label(self, textvariable=self.status).pack(anchor=tk.W, padx=10)
 
+    # ── Data loading
     def _load_data(self):
         try:
-            # FPL: current or next GW for fixture difficulty + player layer
             evs = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=20).json()["events"]
             gw  = next((e["id"] for e in evs if e.get("is_current")), evs[0]["id"])
-            self.team_str, self.avg_ah, self.avg_aa, self.diff_map, self.atk_mult, self.def_mult = fetch_fpl_data(gw + 1)
+            (self.team_str, self.avg_ah, self.avg_aa,
+             self.diff_map, self.atk_mult, self.def_mult) = fetch_fpl_data(gw + 1)
 
-            # Understat: current season EWMA (last 8) + games played
             self.curr_xg, self.curr_xga, self.gp = build_current_ewma(season="2024", span=8)
+            (self.prior_xg, self.prior_xga,
+             self.league_prior_xg, self.league_prior_xga) = build_last_season_priors(prev_season="2023")
 
-            # Understat: last season priors (means)
-            self.prior_xg, self.prior_xga, self.league_prior_xg, self.league_prior_xga = build_last_season_priors(prev_season="2023")
-
-            # Blend (per team): w = min(gp/8, 1)
             all_teams = set(self.curr_xg) | set(self.prior_xg) | set(self.team_str.keys())
             for t in all_teams:
                 gp_t = self.gp.get(t, 0)
                 w = min(gp_t / 8.0, 1.0)
-
                 pxg  = self.prior_xg.get(t,  self.league_prior_xg)
                 pxga = self.prior_xga.get(t, self.league_prior_xga)
-                cxg  = self.curr_xg.get(t,  pxg)   # if no current yet, start at prior
+                cxg  = self.curr_xg.get(t,  pxg)
                 cxga = self.curr_xga.get(t, pxga)
-
                 self.blend_xg[t]  = w * cxg  + (1 - w) * pxg
                 self.blend_xga[t] = w * cxga + (1 - w) * pxga
 
-            # League avg of blended xGA (for defence normalisation)
             self.league_blend_xga = sum(self.blend_xga.values()) / max(1, len(self.blend_xga))
-
-            layer = " + player availability" if USE_PLAYER_LAYER else ""
-            self.status.set(f"✅ Data loaded, ready to predict{layer}.")
+            self.status.set("✅ Data loaded. Enter fixtures, then double-click 'Market Odds' to price.")
         except Exception as e:
             self.status.set(f"❌ Load error: {e}")
 
+    # ── Prediction
     def on_predict(self):
         if not self.blend_xg:
             messagebox.showwarning("Please wait", "Data still loading…")
             return
 
+        # preserve any already-entered odds by fixture key
+        prev_odds = {}
+        for iid, r in self.rows.items():
+            prev_odds[r["Fixture"]] = r.get("Odds")
+
         self.tree.delete(*self.tree.get_children())
+        self.rows.clear()
 
         lines = [l.strip() for l in self.text.get("1.0", tk.END).splitlines() if l.strip()]
+        tmp_rows = []
+
         for line in lines:
             if "vs" not in line: 
                 continue
             home, away = [s.strip() for s in line.split("vs", 1)]
             h, a = home.lower(), away.lower()
 
-            # Blended xG/xGA (current-season EWMA + last-season prior)
             xg_h  = self.blend_xg.get(home, self.league_prior_xg)
             xg_a  = self.blend_xg.get(away, self.league_prior_xg)
             xga_h = self.blend_xga.get(home, self.league_prior_xga)
             xga_a = self.blend_xga.get(away, self.league_prior_xga)
 
-            # FPL team strength (normalised to league avg)
             th = self.team_str.get(h, {})
             ta = self.team_str.get(a, {})
             sa_h = th.get("strength_attack_home", self.avg_ah) / self.avg_ah
             sa_a = ta.get("strength_attack_away", self.avg_aa) / self.avg_aa
 
-            # Defence factors from xGA (lower is better → reduces opponent λ)
             df_h_raw = xga_h / (self.league_blend_xga or 1.0)
             df_a_raw = xga_a / (self.league_blend_xga or 1.0)
             df_h = df_h_raw ** DEF_EXP
             df_a = df_a_raw ** DEF_EXP
 
-            # Fixture difficulty scaling: 1 (easy) → 1.0, 5 (hard) → 0.2
             diff_h, diff_a = self.diff_map.get((h, a), (3, 3))
             factor_h = (6 - diff_h) / 5.0
             factor_a = (6 - diff_a) / 5.0
 
-            # Base poisson rates
             lam1 = xg_h * sa_h * df_a * factor_h
             lam2 = xg_a * sa_a * df_h * factor_a
 
-            # ---- Player availability multipliers (attack & defence)
             if USE_PLAYER_LAYER:
                 am_h = self.atk_mult.get(h, 1.0)
                 am_a = self.atk_mult.get(a, 1.0)
-                dm_h = self.def_mult.get(h, 1.0)  # bigger = stronger defence available
+                dm_h = self.def_mult.get(h, 1.0)
                 dm_a = self.def_mult.get(a, 1.0)
-
                 lam1 *= am_h * (1.0 / max(1e-6, dm_a))
                 lam2 *= am_a * (1.0 / max(1e-6, dm_h))
 
-            # Favourite & home-favourite boosts at lambda-level
             if lam1 > lam2:
                 lam1 *= FAV_BOOST * HOME_FAV_BOOST
                 lam2 *= FAV_BOOST
             else:
                 lam2 *= FAV_BOOST
 
-            # Pick most likely exact score
-            H, A = pick_scoreline(lam1, lam2, rho=RHO, max_goals=MAX_GOALS)
-            self.tree.insert("", tk.END, values=(f"{home} vs {away}", f"{H} - {A}"))
+            H, A, p_mode = mode_and_prob(lam1, lam2, rho=RHO, max_goals=MAX_GOALS)
+            fair_odds_nv = (1.0 / p_mode) if p_mode > 0 else float('inf')
+            fair_odds_ex = min_odds_for_pos_ev_on_exchange(p_mode, commission=DEFAULT_EXCH_COMM)
+
+            fixture_key = f"{home} vs {away}"
+            tmp_rows.append({
+                "Fixture": fixture_key,
+                "Pred": f"{H} - {A}",
+                "Prob": p_mode,
+                "Fair": fair_odds_nv,
+                "FairEx": fair_odds_ex,
+                "Odds": prev_odds.get(fixture_key)  # restore any odds you entered earlier
+            })
+
+        # default sort by Prob desc (until odds entered)
+        tmp_rows.sort(key=lambda r: r["Prob"], reverse=True)
+
+        for r in tmp_rows:
+            edge_str, ev_str, odds_str = "", "", ""
+            if r.get("Odds"):
+                odds = float(r["Odds"])
+                imp = 1.0 / odds
+                edge_pct = (r["Prob"] - imp) * 100.0
+                ev = r["Prob"] * (odds - 1.0) - (1.0 - r["Prob"])
+                edge_str = f"{edge_pct:.1f}"
+                ev_str = f"{ev:.3f}"
+                odds_str = f"{odds:.2f}"
+
+            iid = self.tree.insert(
+                "", tk.END,
+                values=(
+                    r["Fixture"],
+                    r["Pred"],
+                    f"{r['Prob']*100:.1f}",
+                    f"{r['Fair']:.2f}",
+                    f"{r['FairEx']:.2f}",
+                    odds_str,
+                    (edge_str + "%" if edge_str else ""),
+                    ev_str
+                )
+            )
+            self.rows[iid] = r
+
+    # ── Editing odds in-table
+    def on_tree_double_click(self, event):
+        region = self.tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        column = self.tree.identify_column(event.x)  # '#1', '#2', ...
+        col_index = int(column.replace("#", "")) - 1
+        col_name = self.cols[col_index]
+        if col_name != "Market Odds":
+            return
+
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        r = self.rows.get(iid)
+        if not r:
+            return
+
+        # Ask for odds
+        cur = "" if not r.get("Odds") else str(r["Odds"])
+        ans = simpledialog.askstring("Market Odds", f"Enter decimal odds for:\n{r['Fixture']}  [{r['Pred']}]", initialvalue=cur, parent=self)
+        if ans is None:
+            return
+        try:
+            odds = float(ans)
+            if odds <= 1.0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("Invalid odds", "Please enter decimal odds > 1.0.")
+            return
+
+        r["Odds"] = odds
+        # recompute edge + EV
+        imp = 1.0 / odds
+        edge_pct = (r["Prob"] - imp) * 100.0
+        ev = r["Prob"] * (odds - 1.0) - (1.0 - r["Prob"])
+
+        # update row display
+        vals = list(self.tree.item(iid, "values"))
+        vals[5] = f"{odds:.2f}"          # Market Odds
+        vals[6] = f"{edge_pct:.1f}%"     # Edge %
+        vals[7] = f"{ev:.3f}"            # EV/£
+        self.tree.item(iid, values=tuple(vals))
+
+        # resort: rows with odds -> sort by Edge desc; else keep by Prob
+        self._resort()
+
+    def _resort(self):
+        # pull all rows into list with numeric sort keys
+        entries = []
+        for iid, r in self.rows.items():
+            edge = None
+            if r.get("Odds"):
+                try:
+                    edge = (r["Prob"] - 1.0 / float(r["Odds"])) * 100.0
+                except Exception:
+                    edge = None
+            entries.append((iid, r, edge))
+
+        if any(e is not None for _, _, e in entries):
+            # sort by Edge desc; rows without odds sink
+            entries.sort(key=lambda x: (-1e9 if x[2] is None else x[2]), reverse=True)
+        else:
+            entries.sort(key=lambda x: x[1]["Prob"], reverse=True)
+
+        # reinsert in new order
+        for iid, _, _ in entries:
+            self.tree.move(iid, "", "end")
 
 if __name__ == "__main__":
     ScorePredictApp().mainloop()
