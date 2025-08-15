@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Exact Score Predictor — Priors + EWMA + FPL availability + Fixture Difficulty
-# Unified team slugs across FPL + Understat + user input; in-table odds + EV.
+# Uses LOCAL-MAP score selection (3x3 around expected goals) to avoid 2–1 clustering.
+# Keeps aliases; promoted handling; gentle tilts; tiny rho; no total-goals cap.
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
@@ -10,19 +11,25 @@ from collections import defaultdict
 # =========================
 # Tunables
 # =========================
-DEF_EXP        = 0.90   # defence dampening exponent on xGA
-FAV_BOOST      = 1.30   # favourite boost
-HOME_FAV_BOOST = 1.20   # extra if favourite is home
-RHO            = 0.5    # bivariate Poisson correlation-ish
+DEF_EXP        = 0.90    # Understat xGA -> defence softness exponent
+RHO            = 0.08    # tiny correlation: allows low scores without draw clustering
 MAX_GOALS      = 6
+
+# Non-sum-preserving tilts (allow favourites to pull away, but gently)
+HOME_ADV       = 1.03    # modest home lift
+K_TILT         = 0.80    # strength-ratio exponent (higher => more asymmetry)
 
 # Player availability layer (FPL)
 USE_PLAYER_LAYER   = True
-ATK_TOP_N          = 5        # best MIDs/FWDs considered "core attackers"
-DEF_TOP_N          = 4        # best DEFs (plus GK) considered "core defenders"
-ATK_CLIP           = (0.85, 1.15)
-DEF_CLIP           = (0.90, 1.15)
-DEF_AVAIL_EXP      = 1.00     # >1 makes missing defenders hurt more
+ATK_TOP_N          = 5
+DEF_TOP_N          = 4
+ATK_CLIP           = (0.80, 1.25)
+DEF_CLIP           = (0.85, 1.20)
+DEF_AVAIL_EXP      = 1.00
+
+# Promoted-team adjustment (if missing last-season EPL priors)
+PROM_ATK           = 0.90     # trim their attack baseline
+PROM_DEF           = 1.10     # worsen their conceded side
 
 # Betting utilities
 DEFAULT_EXCH_COMM  = 0.02     # 2% exchange commission for fair-odds adj
@@ -72,19 +79,23 @@ def bivariate_pmf(h, a, lam1, lam2, lam3):
         tot += num / den
     return base * tot
 
-def mode_and_prob(lam1, lam2, rho=RHO, max_goals=MAX_GOALS):
-    lam3 = rho * min(lam1, lam2)
-    best, best_p = (0, 0), 0.0
-    for H in range(max_goals + 1):
-        for A in range(max_goals + 1):
-            p = bivariate_pmf(H, A, lam1, lam2, lam3)
-            if p > best_p:
-                best, best_p = (H, A), p
-    return best[0], best[1], best_p
-
 def min_odds_for_pos_ev_on_exchange(p, commission=DEFAULT_EXCH_COMM):
     if p <= 0: return float('inf')
     return 1.0 + (1.0/p - 1.0) / max(1e-6, (1.0 - commission))
+
+def local_map_score(lam1, lam2, rho=0.0, max_goals=6):
+    """Pick the highest-probability score in a 3x3 grid around (round(mu_h), round(mu_a))."""
+    lam3 = rho * min(lam1, lam2)
+    mu_h, mu_a = lam1 + lam3, lam2 + lam3
+    Hc, Ac = int(round(mu_h)), int(round(mu_a))
+    best = (-1.0, 0, 0)
+    for H in range(max(0, Hc-1), min(max_goals, Hc+1)+1):
+        for A in range(max(0, Ac-1), min(max_goals, Ac+1)+1):
+            p = bivariate_pmf(H, A, lam1, lam2, lam3)
+            if p > best[0]:
+                best = (p, H, A)
+    p, H, A = best
+    return H, A, p
 
 # =========================
 # Understat scraping (robust)
@@ -256,7 +267,7 @@ def fetch_fpl_data(gw):
             diff_map[(h, a)] = (f.get("team_h_difficulty",3), f.get("team_a_difficulty",3))
 
     atk_mult, def_mult = build_player_availability_multipliers(elements, id2slug)
-    return team_str, avg_ah, avg_aa, diff_map, atk_mult, def_mult
+    return team_str, avg_ah, avg_aa, diff_map, atk_mult, def_mult, id2slug
 
 # =========================
 # GUI App
@@ -284,6 +295,9 @@ class ScorePredictApp(tk.Tk):
         self.diff_map = {}
         self.atk_mult = defaultdict(lambda: 1.0)
         self.def_mult = defaultdict(lambda: 1.0)
+        self.avg_dh = 50.0
+        self.avg_da = 50.0
+        self.id2slug = {}
 
         # rows cache: item_id -> dict
         self.rows = {}
@@ -299,7 +313,7 @@ class ScorePredictApp(tk.Tk):
         cols = ["Fixture", "Predicted Score", "Model Prob %", "Fair Odds", "Fair O (exch 2%)", "Market Odds", "Edge %", "EV/£"]
         self.cols = cols
         self.tree = ttk.Treeview(self, columns=cols, show="headings", height=14)
-        for c, w in zip(cols, [220, 120, 100, 100, 120, 100, 90, 80]):
+        for c, w in zip(cols, [220, 140, 100, 100, 120, 100, 90, 80]):
             self.tree.heading(c, text=c)
             self.tree.column(c, anchor=tk.CENTER, width=w)
         self.tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
@@ -312,12 +326,18 @@ class ScorePredictApp(tk.Tk):
     # ── Data loading
     def _load_data(self):
         try:
-            evs = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=20).json()["events"]
+            bs = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=20).json()
+            evs = bs["events"]
             gw  = next((e["id"] for e in evs if e.get("is_current")), evs[0]["id"])
 
-            # Use next GW fixtures for pricing (you can change to gw if needed)
             (self.team_str, self.avg_ah, self.avg_aa,
-             self.diff_map, self.atk_mult, self.def_mult) = fetch_fpl_data(gw + 1)
+             self.diff_map, self.atk_mult, self.def_mult, self.id2slug) = fetch_fpl_data(gw)
+
+            # Defensive league averages for normalization
+            dh_vals = [t["strength_defence_home"] for t in self.team_str.values() if "strength_defence_home" in t]
+            da_vals = [t["strength_defence_away"] for t in self.team_str.values() if "strength_defence_away" in t]
+            self.avg_dh = sum(dh_vals)/len(dh_vals) if dh_vals else 50.0
+            self.avg_da = sum(da_vals)/len(da_vals) if da_vals else 50.0
 
             # Understat trends (slugs applied inside)
             self.curr_xg, self.curr_xga, self.gp = build_current_ewma(season="2024", span=8)
@@ -358,6 +378,9 @@ class ScorePredictApp(tk.Tk):
         lines = [l.strip() for l in self.text.get("1.0", tk.END).splitlines() if l.strip()]
         tmp_rows = []
 
+        # Gentle, symmetric FD map (neutral at 3)
+        FD_FACTOR = {1: 1.10, 2: 1.05, 3: 1.00, 4: 0.95, 5: 0.90}
+
         for line in lines:
             if "vs" not in line: 
                 continue
@@ -370,56 +393,72 @@ class ScorePredictApp(tk.Tk):
             xga_h = self.blend_xga.get(h, self.league_prior_xga)
             xga_a = self.blend_xga.get(a, self.league_prior_xga)
 
-            # FPL strengths (normalised around league avg)
+            # Promoted / missing-prior adjustments
+            if h not in self.prior_xg:
+                xg_h  *= PROM_ATK
+                xga_h *= PROM_DEF
+            if a not in self.prior_xg:
+                xg_a  *= PROM_ATK
+                xga_a *= PROM_DEF
+
+            # FPL strengths (attack & DEFENCE normalized)
             th = self.team_str.get(h, {})
             ta = self.team_str.get(a, {})
             sa_h = (th.get("strength_attack_home", self.avg_ah) / self.avg_ah) if self.avg_ah else 1.0
             sa_a = (ta.get("strength_attack_away", self.avg_aa) / self.avg_aa) if self.avg_aa else 1.0
+            sd_h = (th.get("strength_defence_home", self.avg_dh) / self.avg_dh) if self.avg_dh else 1.0
+            sd_a = (ta.get("strength_defence_away", self.avg_da) / self.avg_da) if self.avg_da else 1.0
 
-            # Defence dampening vs league
-            df_h_raw = xga_h / (self.league_blend_xga or 1.0)
-            df_a_raw = xga_a / (self.league_blend_xga or 1.0)
-            df_h = df_h_raw ** DEF_EXP
-            df_a = df_a_raw ** DEF_EXP
+            # Understat defence dampening vs league
+            df_h = (xga_h / (self.league_blend_xga or 1.0)) ** DEF_EXP
+            df_a = (xga_a / (self.league_blend_xga or 1.0)) ** DEF_EXP
 
-            # Fixture difficulty (home/away correct) — fallback neutral (3,3)
-            diff_h, diff_a = self.diff_map.get((h, a), (3, 3))
-            factor_h = (6 - diff_h) / 5.0
-            factor_a = (6 - diff_a) / 5.0
-
-            # Team-level goal rates
-            lam1 = xg_h * sa_h * df_a * factor_h
-            lam2 = xg_a * sa_a * df_h * factor_a
-
-            # Player availability layer (core attackers/defenders)
-            if USE_PLAYER_LAYER:
-                am_h = self.atk_mult.get(h, 1.0)
-                am_a = self.atk_mult.get(a, 1.0)
-                dm_h = self.def_mult.get(h, 1.0)
-                dm_a = self.def_mult.get(a, 1.0)
-                lam1 *= am_h * (1.0 / max(1e-6, dm_a))
-                lam2 *= am_a * (1.0 / max(1e-6, dm_h))
-
-            # Favourite boost (extra if favourite is home)
-            if lam1 > lam2:
-                lam1 *= FAV_BOOST * HOME_FAV_BOOST
-                lam2 *= FAV_BOOST
+            # Fixture difficulty (gentle; neutral if not found)
+            diff = self.diff_map.get((h, a))
+            if diff:
+                diff_h, diff_a = diff
+                factor_h = FD_FACTOR.get(int(diff_h), 1.0)
+                factor_a = FD_FACTOR.get(int(diff_a), 1.0)
             else:
-                lam2 *= FAV_BOOST
+                factor_h = factor_a = 1.0
 
-            # Mode score + probability
-            H, A, p_mode = mode_and_prob(lam1, lam2, rho=RHO, max_goals=MAX_GOALS)
-            fair_odds_nv = (1.0 / p_mode) if p_mode > 0 else float('inf')
-            fair_odds_ex = min_odds_for_pos_ev_on_exchange(p_mode, commission=DEFAULT_EXCH_COMM)
+            # Team-level goal rates (pre player layer)
+            # Opponent defensive strength reduces goals: use 1/sd_*
+            lam1 = xg_h * sa_h * (1.0 / max(1e-6, sd_a)) * df_a * factor_h
+            lam2 = xg_a * sa_a * (1.0 / max(1e-6, sd_h)) * df_h * factor_a
+
+            # Player availability layer — nudge own attack only
+            if USE_PLAYER_LAYER:
+                lam1 *= self.atk_mult.get(h, 1.0)
+                lam2 *= self.atk_mult.get(a, 1.0)
+
+            # Non-sum-preserving home advantage (modest)
+            lam1 *= HOME_ADV
+
+            # Strength ratio tilt (favourite separation), using current rates as proxy
+            r = max(1e-6, lam2 / max(1e-6, lam1))
+            if r > 1.0:
+                tilt = r ** K_TILT    # away stronger
+                lam2 *= tilt
+                lam1 /= tilt
+            else:
+                tilt = (1.0 / r) ** K_TILT  # home stronger
+                lam1 *= tilt
+                lam2 /= tilt
+
+            # === LOCAL-MAP predicted score (3x3 around expected goals) ===
+            H_pred, A_pred, p_pred = local_map_score(lam1, lam2, rho=RHO, max_goals=MAX_GOALS)
+            fair_odds_nv = (1.0 / p_pred) if p_pred > 0 else float('inf')
+            fair_odds_ex = min_odds_for_pos_ev_on_exchange(p_pred, commission=DEFAULT_EXCH_COMM)
 
             fixture_key = f"{home.strip()} vs {away.strip()}"  # keep user formatting for display
             tmp_rows.append({
                 "Fixture": fixture_key,
-                "Pred": f"{H} - {A}",
-                "Prob": p_mode,
+                "Pred": f"{H_pred} - {A_pred}",
+                "Prob": p_pred,
                 "Fair": fair_odds_nv,
                 "FairEx": fair_odds_ex,
-                "Odds": prev_odds.get(fixture_key)  # restore any odds you entered earlier
+                "Odds": prev_odds.get(fixture_key)
             })
 
         # default sort by Prob desc (until odds entered)
@@ -512,7 +551,7 @@ class ScorePredictApp(tk.Tk):
 
         if any(e is not None for _, _, e in entries):
             # sort by Edge desc; rows without odds sink
-            entries.sort(key=lambda x: (-1e9 if x[2] is None else x[2]), reverse=True)
+            entries.sort(key=lambda x: (-1e-9 if x[2] is None else x[2]), reverse=True)
         else:
             entries.sort(key=lambda x: x[1]["Prob"], reverse=True)
 
