@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+# Exact Score Predictor — Priors + EWMA + FPL availability + Fixture Difficulty
+# Unified team slugs across FPL + Understat + user input; in-table odds + EV.
+
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 import threading, requests, re, json, math, time
@@ -22,6 +26,39 @@ DEF_AVAIL_EXP      = 1.00     # >1 makes missing defenders hurt more
 
 # Betting utilities
 DEFAULT_EXCH_COMM  = 0.02     # 2% exchange commission for fair-odds adj
+
+# =========================
+# Team name normalisation (user input, FPL, Understat)
+# =========================
+SLUG_ALIASES = {
+    # Big 6
+    "arsenal":"arsenal",
+    "manchester city":"man_city","man city":"man_city","man c":"man_city",
+    "manchester united":"man_utd","man utd":"man_utd","man united":"man_utd","man u":"man_utd",
+    "liverpool":"liverpool",
+    "chelsea":"chelsea",
+    "tottenham":"spurs","tottenham hotspur":"spurs","spurs":"spurs",
+    # Others in current EPL list
+    "aston villa":"aston_villa","villa":"aston_villa",
+    "brighton":"brighton","brighton & hove albion":"brighton","brighton and hove albion":"brighton",
+    "bournemouth":"bournemouth","afc bournemouth":"bournemouth",
+    "brentford":"brentford",
+    "crystal palace":"crystal_palace","palace":"crystal_palace",
+    "everton":"everton",
+    "fulham":"fulham",
+    "ipswich":"ipswich","ipswich town":"ipswich",
+    "leicester":"leicester","leicester city":"leicester",
+    "newcastle":"newcastle","newcastle united":"newcastle",
+    "nottingham forest":"nottingham_forest","nott'm forest":"nottingham_forest","forest":"nottingham_forest",
+    "southampton":"southampton",
+    "west ham":"west_ham","west ham united":"west_ham",
+    "wolves":"wolves","wolverhampton":"wolves","wolverhampton wanderers":"wolves",
+}
+def _clean_name(s: str) -> str:
+    return (s or "").lower().replace("’","'").replace(".", "").strip()
+def to_slug(name: str) -> str:
+    key = _clean_name(name)
+    return SLUG_ALIASES.get(key, key)
 
 # =========================
 # Bivariate Poisson helpers
@@ -94,8 +131,8 @@ def _team_timeseries_from_matches(matches):
     xg_against = defaultdict(list)
     games_played = defaultdict(int)
     for m in matches:
-        home = m["h"]["title"]
-        away = m["a"]["title"]
+        home = to_slug(m["h"]["title"])
+        away = to_slug(m["a"]["title"])
         xGh  = float(m["xG"]["h"])
         xGa  = float(m["xG"]["a"])
         xg_for[home].append(xGh)
@@ -132,7 +169,7 @@ def build_last_season_priors(prev_season="2023"):
     return prior_xg, prior_xga, league_prior_xg, league_prior_xga
 
 # =========================
-# FPL data (strength + fixtures + players)
+# FPL data (strength + fixtures + players) — keyed by slug
 # =========================
 def _to_float(x): 
     try: return float(x)
@@ -155,12 +192,11 @@ def _per90(val, minutes):
     m = max(1, int(minutes or 0))
     return _to_float(val) * 90.0 / m
 
-def build_player_availability_multipliers(elements, teams):
-    id2name = {t["id"]: t["name"].lower() for t in teams}
+def build_player_availability_multipliers(elements, id2slug):
     by_team = defaultdict(list)
     for p in elements:
         p = dict(p)
-        p["team_name"] = id2name.get(p["team"], None)
+        p["team_name"] = id2slug.get(p["team"])  # store slug
         if p["team_name"]:
             by_team[p["team_name"]].append(p)
     attack_mult, def_mult = {}, {}
@@ -193,17 +229,33 @@ def fetch_fpl_data(gw):
     teams    = bs["teams"]
     elements = bs["elements"]
     fixtures = requests.get(f"https://fantasy.premierleague.com/api/fixtures/?event={gw}", timeout=20).json()
-    id2name = {t["id"]: t["name"].lower() for t in teams}
-    team_str = {t["name"].lower(): t for t in teams}
+
+    # team_id -> slug (from FPL full name)
+    id2slug = {t["id"]: to_slug(t["name"]) for t in teams}
+
+    # team strengths keyed by slug
+    team_str = {}
+    for t in teams:
+        slug = id2slug[t["id"]]
+        team_str[slug] = {
+            "strength_attack_home": t["strength_attack_home"],
+            "strength_attack_away": t["strength_attack_away"],
+            "strength_defence_home": t["strength_defence_home"],
+            "strength_defence_away": t["strength_defence_away"],
+        }
+
     avg_ah = sum(t["strength_attack_home"] for t in teams) / len(teams)
     avg_aa = sum(t["strength_attack_away"] for t in teams) / len(teams)
+
+    # fixture difficulties keyed by (home_slug, away_slug)
     diff_map = {}
     for f in fixtures:
-        h = id2name.get(f["team_h"])
-        a = id2name.get(f["team_a"])
+        h = id2slug.get(f["team_h"])
+        a = id2slug.get(f["team_a"])
         if h and a:
             diff_map[(h, a)] = (f.get("team_h_difficulty",3), f.get("team_a_difficulty",3))
-    atk_mult, def_mult = build_player_availability_multipliers(elements, teams)
+
+    atk_mult, def_mult = build_player_availability_multipliers(elements, id2slug)
     return team_str, avg_ah, avg_aa, diff_map, atk_mult, def_mult
 
 # =========================
@@ -215,7 +267,7 @@ class ScorePredictApp(tk.Tk):
         self.title("Exact Score Predictor (priors + EWMA + FPL availability + in-table odds)")
         self.geometry("980x640")
 
-        # Data containers
+        # Data containers (all keyed by slug)
         self.curr_xg = {}
         self.curr_xga = {}
         self.gp = {}
@@ -262,13 +314,17 @@ class ScorePredictApp(tk.Tk):
         try:
             evs = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=20).json()["events"]
             gw  = next((e["id"] for e in evs if e.get("is_current")), evs[0]["id"])
+
+            # Use next GW fixtures for pricing (you can change to gw if needed)
             (self.team_str, self.avg_ah, self.avg_aa,
              self.diff_map, self.atk_mult, self.def_mult) = fetch_fpl_data(gw + 1)
 
+            # Understat trends (slugs applied inside)
             self.curr_xg, self.curr_xga, self.gp = build_current_ewma(season="2024", span=8)
             (self.prior_xg, self.prior_xga,
              self.league_prior_xg, self.league_prior_xga) = build_last_season_priors(prev_season="2023")
 
+            # Blend priors toward current EWMA based on games played
             all_teams = set(self.curr_xg) | set(self.prior_xg) | set(self.team_str.keys())
             for t in all_teams:
                 gp_t = self.gp.get(t, 0)
@@ -306,30 +362,36 @@ class ScorePredictApp(tk.Tk):
             if "vs" not in line: 
                 continue
             home, away = [s.strip() for s in line.split("vs", 1)]
-            h, a = home.lower(), away.lower()
+            h, a = to_slug(home), to_slug(away)   # canonical slugs
 
-            xg_h  = self.blend_xg.get(home, self.league_prior_xg)
-            xg_a  = self.blend_xg.get(away, self.league_prior_xg)
-            xga_h = self.blend_xga.get(home, self.league_prior_xga)
-            xga_a = self.blend_xga.get(away, self.league_prior_xga)
+            # xG/xGA baselines (blended)
+            xg_h  = self.blend_xg.get(h, self.league_prior_xg)
+            xg_a  = self.blend_xg.get(a, self.league_prior_xg)
+            xga_h = self.blend_xga.get(h, self.league_prior_xga)
+            xga_a = self.blend_xga.get(a, self.league_prior_xga)
 
+            # FPL strengths (normalised around league avg)
             th = self.team_str.get(h, {})
             ta = self.team_str.get(a, {})
-            sa_h = th.get("strength_attack_home", self.avg_ah) / self.avg_ah
-            sa_a = ta.get("strength_attack_away", self.avg_aa) / self.avg_aa
+            sa_h = (th.get("strength_attack_home", self.avg_ah) / self.avg_ah) if self.avg_ah else 1.0
+            sa_a = (ta.get("strength_attack_away", self.avg_aa) / self.avg_aa) if self.avg_aa else 1.0
 
+            # Defence dampening vs league
             df_h_raw = xga_h / (self.league_blend_xga or 1.0)
             df_a_raw = xga_a / (self.league_blend_xga or 1.0)
             df_h = df_h_raw ** DEF_EXP
             df_a = df_a_raw ** DEF_EXP
 
+            # Fixture difficulty (home/away correct) — fallback neutral (3,3)
             diff_h, diff_a = self.diff_map.get((h, a), (3, 3))
             factor_h = (6 - diff_h) / 5.0
             factor_a = (6 - diff_a) / 5.0
 
+            # Team-level goal rates
             lam1 = xg_h * sa_h * df_a * factor_h
             lam2 = xg_a * sa_a * df_h * factor_a
 
+            # Player availability layer (core attackers/defenders)
             if USE_PLAYER_LAYER:
                 am_h = self.atk_mult.get(h, 1.0)
                 am_a = self.atk_mult.get(a, 1.0)
@@ -338,17 +400,19 @@ class ScorePredictApp(tk.Tk):
                 lam1 *= am_h * (1.0 / max(1e-6, dm_a))
                 lam2 *= am_a * (1.0 / max(1e-6, dm_h))
 
+            # Favourite boost (extra if favourite is home)
             if lam1 > lam2:
                 lam1 *= FAV_BOOST * HOME_FAV_BOOST
                 lam2 *= FAV_BOOST
             else:
                 lam2 *= FAV_BOOST
 
+            # Mode score + probability
             H, A, p_mode = mode_and_prob(lam1, lam2, rho=RHO, max_goals=MAX_GOALS)
             fair_odds_nv = (1.0 / p_mode) if p_mode > 0 else float('inf')
             fair_odds_ex = min_odds_for_pos_ev_on_exchange(p_mode, commission=DEFAULT_EXCH_COMM)
 
-            fixture_key = f"{home} vs {away}"
+            fixture_key = f"{home.strip()} vs {away.strip()}"  # keep user formatting for display
             tmp_rows.append({
                 "Fixture": fixture_key,
                 "Pred": f"{H} - {A}",
