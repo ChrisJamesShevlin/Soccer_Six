@@ -3,6 +3,7 @@
 # Uses LOCAL-MAP score selection (3x3 around expected goals) to avoid 2–1 clustering.
 # Keeps aliases; promoted handling; gentle tilts; tiny rho; no total-goals cap.
 # Adds: Result (H/D/A), Result %, Market Odds editing, and a "Check Data" button.
+# NEW: TILT_CAP to prevent extreme scorelines like 6–0 in lopsided matches.
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
@@ -19,6 +20,7 @@ MAX_GOALS      = 6
 # Non-sum-preserving tilts (allow favourites to pull away, but gently)
 HOME_ADV       = 1.03    # modest home lift
 K_TILT         = 0.80    # strength-ratio exponent (higher => more asymmetry)
+TILT_CAP       = 1.60    # NEW: cap the tilt multiplier to avoid extreme separations
 
 # Player availability layer (FPL)
 USE_PLAYER_LAYER   = True
@@ -461,11 +463,11 @@ class ScorePredictApp(tk.Tk):
             # Strength ratio tilt (favourite separation), using current rates as proxy
             r = max(1e-6, lam2 / max(1e-6, lam1))
             if r > 1.0:
-                tilt = r ** K_TILT    # away stronger
+                tilt = min(r ** K_TILT, TILT_CAP)         # away stronger (cap applied)
                 lam2 *= tilt
                 lam1 /= tilt
             else:
-                tilt = (1.0 / r) ** K_TILT  # home stronger
+                tilt = min((1.0 / r) ** K_TILT, TILT_CAP) # home stronger (cap applied)
                 lam1 *= tilt
                 lam2 /= tilt
 
