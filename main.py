@@ -97,6 +97,22 @@ def local_map_score(lam1, lam2, rho=0.0, max_goals=6):
     p, H, A = best
     return H, A, p
 
+# NEW: result probabilities + letter
+def result_probs(lam1, lam2, rho=RHO, max_goals=8):
+    lam3 = rho * min(lam1, lam2)
+    pH = pD = pA = 0.0
+    for H in range(max_goals + 1):
+        for A in range(max_goals + 1):
+            p = bivariate_pmf(H, A, lam1, lam2, lam3)
+            if H > A:   pH += p
+            elif H == A:pD += p
+            else:       pA += p
+    s = pH + pD + pA
+    if s > 0: pH, pD, pA = pH/s, pD/s, pA/s
+    if pH >= pD and pH >= pA: return "H", pH
+    if pA >= pH and pA >= pD: return "A", pA
+    return "D", pD
+
 # =========================
 # Understat scraping (robust)
 # =========================
@@ -276,7 +292,7 @@ class ScorePredictApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Exact Score Predictor (priors + EWMA + FPL availability + in-table odds)")
-        self.geometry("980x640")
+        self.geometry("1000x640")
 
         # Data containers (all keyed by slug)
         self.curr_xg = {}
@@ -310,10 +326,11 @@ class ScorePredictApp(tk.Tk):
         self.text = tk.Text(frm, height=6); self.text.pack(fill=tk.X)
         ttk.Button(frm, text="Predict & Rank", command=self.on_predict).pack(pady=6)
 
-        cols = ["Fixture", "Predicted Score", "Model Prob %", "Fair Odds", "Fair O (exch 2%)", "Market Odds", "Edge %", "EV/£"]
+        # NEW: added "Result %" next to "Result"
+        cols = ["Fixture", "Predicted Score", "Result", "Result %", "Model Prob %", "Fair Odds", "Fair O (exch 2%)", "Market Odds", "Edge %", "EV/£"]
         self.cols = cols
         self.tree = ttk.Treeview(self, columns=cols, show="headings", height=14)
-        for c, w in zip(cols, [220, 140, 100, 100, 120, 100, 90, 80]):
+        for c, w in zip(cols, [220, 140, 60, 80, 100, 100, 120, 100, 90, 80]):
             self.tree.heading(c, text=c)
             self.tree.column(c, anchor=tk.CENTER, width=w)
         self.tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
@@ -451,10 +468,15 @@ class ScorePredictApp(tk.Tk):
             fair_odds_nv = (1.0 / p_pred) if p_pred > 0 else float('inf')
             fair_odds_ex = min_odds_for_pos_ev_on_exchange(p_pred, commission=DEFAULT_EXCH_COMM)
 
+            # NEW: most-likely match result + its probability
+            res_letter, res_prob = result_probs(lam1, lam2, rho=RHO, max_goals=8)
+
             fixture_key = f"{home.strip()} vs {away.strip()}"  # keep user formatting for display
             tmp_rows.append({
                 "Fixture": fixture_key,
                 "Pred": f"{H_pred} - {A_pred}",
+                "Res": res_letter,
+                "ResPct": res_prob,   # store as 0–1
                 "Prob": p_pred,
                 "Fair": fair_odds_nv,
                 "FairEx": fair_odds_ex,
@@ -480,6 +502,8 @@ class ScorePredictApp(tk.Tk):
                 values=(
                     r["Fixture"],
                     r["Pred"],
+                    r["Res"],
+                    f"{r['ResPct']*100:.1f}",          # NEW column
                     f"{r['Prob']*100:.1f}",
                     f"{r['Fair']:.2f}",
                     f"{r['FairEx']:.2f}",
@@ -527,11 +551,11 @@ class ScorePredictApp(tk.Tk):
         edge_pct = (r["Prob"] - imp) * 100.0
         ev = r["Prob"] * (odds - 1.0) - (1.0 - r["Prob"])
 
-        # update row display
+        # update row display (use column names so indexes stay correct)
         vals = list(self.tree.item(iid, "values"))
-        vals[5] = f"{odds:.2f}"          # Market Odds
-        vals[6] = f"{edge_pct:.1f}%"     # Edge %
-        vals[7] = f"{ev:.3f}"            # EV/£
+        vals[self.cols.index("Market Odds")] = f"{odds:.2f}"
+        vals[self.cols.index("Edge %")]      = f"{edge_pct:.1f}%"
+        vals[self.cols.index("EV/£")]        = f"{ev:.3f}"
         self.tree.item(iid, values=tuple(vals))
 
         # resort: rows with odds -> sort by Edge desc; else keep by Prob
