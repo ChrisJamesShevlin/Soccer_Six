@@ -2,6 +2,7 @@
 # Exact Score Predictor — Priors + EWMA + FPL availability + Fixture Difficulty
 # Uses LOCAL-MAP score selection (3x3 around expected goals) to avoid 2–1 clustering.
 # Keeps aliases; promoted handling; gentle tilts; tiny rho; no total-goals cap.
+# Adds: Result (H/D/A), Result %, Market Odds editing, and a "Check Data" button.
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
@@ -97,8 +98,8 @@ def local_map_score(lam1, lam2, rho=0.0, max_goals=6):
     p, H, A = best
     return H, A, p
 
-# NEW: result probabilities + letter
 def result_probs(lam1, lam2, rho=RHO, max_goals=8):
+    """Return most likely result letter and its probability."""
     lam3 = rho * min(lam1, lam2)
     pH = pD = pA = 0.0
     for H in range(max_goals + 1):
@@ -292,7 +293,7 @@ class ScorePredictApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Exact Score Predictor (priors + EWMA + FPL availability + in-table odds)")
-        self.geometry("1000x640")
+        self.geometry("1000x660")
 
         # Data containers (all keyed by slug)
         self.curr_xg = {}
@@ -314,6 +315,7 @@ class ScorePredictApp(tk.Tk):
         self.avg_dh = 50.0
         self.avg_da = 50.0
         self.id2slug = {}
+        self.gw_loaded = None
 
         # rows cache: item_id -> dict
         self.rows = {}
@@ -324,12 +326,15 @@ class ScorePredictApp(tk.Tk):
         frm = ttk.Frame(self); frm.pack(fill=tk.X, padx=10, pady=10)
         ttk.Label(frm, text="Fixtures (one per line, e.g. 'Arsenal vs Chelsea'). Double-click a 'Market Odds' cell to enter a price.").pack(anchor=tk.W)
         self.text = tk.Text(frm, height=6); self.text.pack(fill=tk.X)
-        ttk.Button(frm, text="Predict & Rank", command=self.on_predict).pack(pady=6)
 
-        # NEW: added "Result %" next to "Result"
+        btnrow = ttk.Frame(frm); btnrow.pack(pady=6)
+        ttk.Button(btnrow, text="Predict & Rank", command=self.on_predict).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btnrow, text="Check Data",   command=self.on_check_data).pack(side=tk.LEFT, padx=4)
+
+        # Columns include Result and Result %
         cols = ["Fixture", "Predicted Score", "Result", "Result %", "Model Prob %", "Fair Odds", "Fair O (exch 2%)", "Market Odds", "Edge %", "EV/£"]
         self.cols = cols
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=14)
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=16)
         for c, w in zip(cols, [220, 140, 60, 80, 100, 100, 120, 100, 90, 80]):
             self.tree.heading(c, text=c)
             self.tree.column(c, anchor=tk.CENTER, width=w)
@@ -346,6 +351,7 @@ class ScorePredictApp(tk.Tk):
             bs = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=20).json()
             evs = bs["events"]
             gw  = next((e["id"] for e in evs if e.get("is_current")), evs[0]["id"])
+            self.gw_loaded = gw
 
             (self.team_str, self.avg_ah, self.avg_aa,
              self.diff_map, self.atk_mult, self.def_mult, self.id2slug) = fetch_fpl_data(gw)
@@ -468,7 +474,7 @@ class ScorePredictApp(tk.Tk):
             fair_odds_nv = (1.0 / p_pred) if p_pred > 0 else float('inf')
             fair_odds_ex = min_odds_for_pos_ev_on_exchange(p_pred, commission=DEFAULT_EXCH_COMM)
 
-            # NEW: most-likely match result + its probability
+            # Most-likely match result + its probability
             res_letter, res_prob = result_probs(lam1, lam2, rho=RHO, max_goals=8)
 
             fixture_key = f"{home.strip()} vs {away.strip()}"  # keep user formatting for display
@@ -503,7 +509,7 @@ class ScorePredictApp(tk.Tk):
                     r["Fixture"],
                     r["Pred"],
                     r["Res"],
-                    f"{r['ResPct']*100:.1f}",          # NEW column
+                    f"{r['ResPct']*100:.1f}",
                     f"{r['Prob']*100:.1f}",
                     f"{r['Fair']:.2f}",
                     f"{r['FairEx']:.2f}",
@@ -582,6 +588,63 @@ class ScorePredictApp(tk.Tk):
         # reinsert in new order
         for iid, _, _ in entries:
             self.tree.move(iid, "", "end")
+
+    # ── Data check popup (pings FPL + Understat)
+    def on_check_data(self):
+        def _run():
+            lines = []
+            cur = None
+            events = []
+            # FPL bootstrap
+            try:
+                r = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=20)
+                r.raise_for_status()
+                bs = r.json()
+                events = bs.get("events", [])
+                cur = next((e for e in events if e.get("is_current")), None)
+                nxt  = next((e for e in events if e.get("is_next")), None)
+                teams_cnt = len(bs.get("teams", []))
+                elems_cnt = len(bs.get("elements", []))
+                lines.append(f"FPL bootstrap: OK (teams {teams_cnt}, players {elems_cnt})")
+                if cur:
+                    lines.append(f"  Current GW: {cur['id']}  deadline: {cur.get('deadline_time','?')}")
+                if nxt:
+                    lines.append(f"  Next    GW: {nxt['id']}  deadline: {nxt.get('deadline_time','?')}")
+            except Exception as e:
+                lines.append(f"FPL bootstrap: ERROR → {e}")
+
+            # FPL fixtures for loaded GW (or current if missing)
+            try:
+                gw = self.gw_loaded if self.gw_loaded is not None else (cur["id"] if cur else (events[0]["id"] if events else 1))
+                rf = requests.get(f"https://fantasy.premierleague.com/api/fixtures/?event={gw}", timeout=20)
+                rf.raise_for_status()
+                fixtures = rf.json()
+                lines.append(f"FPL fixtures (GW {gw}): OK (fixtures {len(fixtures)})")
+            except Exception as e:
+                lines.append(f"FPL fixtures: ERROR → {e}")
+
+            # Understat EPL season page
+            try:
+                url = "https://understat.com/league/EPL/2024"
+                html = requests.get(url, headers={"User-Agent":"Mozilla/5.0","Accept":"text/html,application/xhtml+xml"}, timeout=20).text
+                data = _extract_json_from_jsonparse(html, "matchesData")
+                n = len(data)
+                last_date = ""
+                try:
+                    last_date = max(m.get("date","") for m in data if m.get("date"))
+                except:
+                    pass
+                teams = set()
+                for m in data[:2000]:
+                    teams.add(to_slug(m["h"]["title"]))
+                    teams.add(to_slug(m["a"]["title"]))
+                lines.append(f"Understat: OK (matches {n}, teams {len(teams)}, last date {last_date or 'n/a'})")
+            except Exception as e:
+                lines.append(f"Understat: ERROR → {e}")
+
+            msg = "\n".join(lines)
+            self.after(0, lambda: messagebox.showinfo("Data Check", msg, parent=self))
+        threading.Thread(target=_run, daemon=True).start()
 
 if __name__ == "__main__":
     ScorePredictApp().mainloop()
