@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-# Exact Score Predictor — Priors + EWMA + FPL availability + Fixture Difficulty
-# Uses LOCAL-MAP score selection (3x3 around expected goals) to avoid 2–1 clustering.
-# Keeps aliases; promoted handling; gentle tilts; tiny rho; no total-goals cap.
-# Adds: Result (H/D/A), Result %, Market Odds editing, and a "Check Data" button.
-# NEW: TILT_CAP to prevent extreme scorelines like 6–0 in lopsided matches.
+# Exact Score Predictor — EWMA + Priors + FPL + Softened FD + Peer Clamp + Debug
+# - FD blended (FD_WEIGHT) and disabled in peer-vs-peer (Big 6) fixtures
+# - Priors looser (selection ONLY), mismatch bump capped, home edge tuned
+# - Debug prints per fixture for tracing lambda, radius, and chosen score
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
@@ -13,14 +12,14 @@ from collections import defaultdict
 # =========================
 # Tunables
 # =========================
-DEF_EXP        = 0.90    # Understat xGA -> defence softness exponent
-RHO            = 0.08    # tiny correlation: allows low scores without draw clustering
+DEF_EXP        = 0.90      # Understat xGA -> defence softness exponent
+RHO            = 0.10      # tiny correlation for low-score dependence
 MAX_GOALS      = 6
 
 # Non-sum-preserving tilts (allow favourites to pull away, but gently)
-HOME_ADV       = 1.03    # modest home lift
-K_TILT         = 0.80    # strength-ratio exponent (higher => more asymmetry)
-TILT_CAP       = 1.60    # NEW: cap the tilt multiplier to avoid extreme separations
+HOME_ADV       = 1.07      # stronger home advantage (~+0.25 goals on average)
+K_TILT         = 0.75      # strength-ratio exponent (higher => more asymmetry)
+TILT_CAP       = 1.55      # cap the tilt multiplier to avoid extreme separations
 
 # Player availability layer (FPL)
 USE_PLAYER_LAYER   = True
@@ -36,6 +35,50 @@ PROM_DEF           = 1.10     # worsen their conceded side
 
 # Betting utilities
 DEFAULT_EXCH_COMM  = 0.02     # 2% exchange commission for fair-odds adj
+
+# =========================
+# Scoreline prior (selection ONLY)
+# =========================
+PRIOR_ALPHA        = 0.12     # milder margin penalty (allows 4–0/5–1 occasionally)
+PRIOR_BETA         = 0.04     # milder total-goals penalty
+PRIOR_DRAW_BONUS   = 0.05     # tiny bump to draws
+
+def _scoreline_prior_weight(H, A,
+                            alpha=PRIOR_ALPHA,
+                            beta=PRIOR_BETA,
+                            draw_bonus=PRIOR_DRAW_BONUS):
+    margin = abs(H - A)
+    total  = H + A
+    w = math.exp(-alpha * margin) * math.exp(-beta * total)
+    if H == A:
+        w *= (1.0 + draw_bonus)
+    return w
+
+# =========================
+# Clear-mismatch bump (extra, capped separation in lopsided fixtures)
+# Applied after the standard ratio-tilt; decided using the pre-tilt ratio.
+# =========================
+MISMATCH_R   = 1.60   # trigger threshold on pre-tilt lambda ratio (dominance)
+MISMATCH_K   = 0.45   # strength of extra tilt
+MISMATCH_CAP = 1.45   # hard cap for the extra tilt factor
+
+# Local map radius (for modal score selection window)
+LOCAL_MAP_RADIUS_DEFAULT  = 1   # 3x3
+LOCAL_MAP_RADIUS_MISMATCH = 2   # 5x5 when mismatch (non-peer only)
+
+# =========================
+# Fixture difficulty controls
+# =========================
+USE_FD   = True
+FD_WEIGHT = 0.35       # 0..1: blend FD toward neutral (lower = gentler)
+
+# Peer-vs-peer clamp (derby/elite fixtures: Big 6 vs Big 6)
+ELITE_TEAMS = {"arsenal","liverpool","man_city","man_utd","spurs","chelsea"}
+PEER_HOME_ADV     = 1.03   # soften home edge in elite vs elite
+PEER_K_TILT       = 0.65   # soften ratio tilt
+PEER_TILT_CAP     = 1.35   # cap separation more
+PEER_MISMATCH_R   = 2.20   # require MUCH bigger dominance to trigger bump
+PEER_MISMATCH_CAP = 1.25   # even if triggered, don’t let it run away
 
 # =========================
 # Team name normalisation (user input, FPL, Understat)
@@ -86,19 +129,26 @@ def min_odds_for_pos_ev_on_exchange(p, commission=DEFAULT_EXCH_COMM):
     if p <= 0: return float('inf')
     return 1.0 + (1.0/p - 1.0) / max(1e-6, (1.0 - commission))
 
-def local_map_score(lam1, lam2, rho=0.0, max_goals=6):
-    """Pick the highest-probability score in a 3x3 grid around (round(mu_h), round(mu_a))."""
+def local_map_score(lam1, lam2, rho=0.0, max_goals=6, radius=1):
+    """
+    Pick the highest-probability score near the expected-goals centre,
+    BUT use a gentle prior ONLY for the selection step. Return the raw probability
+    of the chosen cell so fair odds/EV remain pure.
+    """
     lam3 = rho * min(lam1, lam2)
     mu_h, mu_a = lam1 + lam3, lam2 + lam3
     Hc, Ac = int(round(mu_h)), int(round(mu_a))
-    best = (-1.0, 0, 0)
-    for H in range(max(0, Hc-1), min(max_goals, Hc+1)+1):
-        for A in range(max(0, Ac-1), min(max_goals, Ac+1)+1):
-            p = bivariate_pmf(H, A, lam1, lam2, lam3)
-            if p > best[0]:
-                best = (p, H, A)
-    p, H, A = best
-    return H, A, p
+    best = (-1.0, 0, 0, 0.0)  # (p_sel, H, A, p_raw)
+    H_lo, H_hi = max(0, Hc - radius), min(max_goals, Hc + radius)
+    A_lo, A_hi = max(0, Ac - radius), min(max_goals, Ac + radius)
+    for H in range(H_lo, H_hi + 1):
+        for A in range(A_lo, A_hi + 1):
+            p_raw = bivariate_pmf(H, A, lam1, lam2, lam3)
+            p_sel = p_raw * _scoreline_prior_weight(H, A)
+            if p_sel > best[0]:
+                best = (p_sel, H, A, p_raw)
+    _, H, A, p_raw = best
+    return H, A, p_raw
 
 def result_probs(lam1, lam2, rho=RHO, max_goals=8):
     """Return most likely result letter and its probability."""
@@ -294,7 +344,7 @@ def fetch_fpl_data(gw):
 class ScorePredictApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Exact Score Predictor (priors + EWMA + FPL availability + in-table odds)")
+        self.title("Exact Score Predictor (priors + EWMA + FPL + softened FD + peer clamp)")
         self.geometry("1000x660")
 
         # Data containers (all keyed by slug)
@@ -326,7 +376,7 @@ class ScorePredictApp(tk.Tk):
 
     def _build_ui(self):
         frm = ttk.Frame(self); frm.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Label(frm, text="Fixtures (one per line, e.g. 'Arsenal vs Chelsea'). Double-click a 'Market Odds' cell to enter a price.").pack(anchor=tk.W)
+        ttk.Label(frm, text="Fixtures (one per line, e.g. 'Liverpool vs Arsenal'). Double-click a 'Market Odds' cell to enter a price.").pack(anchor=tk.W)
         self.text = tk.Text(frm, height=6); self.text.pack(fill=tk.X)
 
         btnrow = ttk.Frame(frm); btnrow.pack(pady=6)
@@ -403,14 +453,15 @@ class ScorePredictApp(tk.Tk):
         lines = [l.strip() for l in self.text.get("1.0", tk.END).splitlines() if l.strip()]
         tmp_rows = []
 
-        # Gentle, symmetric FD map (neutral at 3)
-        FD_FACTOR = {1: 1.10, 2: 1.05, 3: 1.00, 4: 0.95, 5: 0.90}
+        # FD raw map (we'll blend with FD_WEIGHT; peer fixtures neutral)
+        FD_RAW = {1: 1.10, 2: 1.05, 3: 1.00, 4: 0.95, 5: 0.90}
 
         for line in lines:
             if "vs" not in line: 
                 continue
             home, away = [s.strip() for s in line.split("vs", 1)]
             h, a = to_slug(home), to_slug(away)   # canonical slugs
+            is_peer = (h in ELITE_TEAMS) and (a in ELITE_TEAMS)
 
             # xG/xGA baselines (blended)
             xg_h  = self.blend_xg.get(h, self.league_prior_xg)
@@ -426,7 +477,7 @@ class ScorePredictApp(tk.Tk):
                 xg_a  *= PROM_ATK
                 xga_a *= PROM_DEF
 
-            # FPL strengths (attack & DEFENCE normalized)
+            # FPL strengths (attack & DEFENCE normalized vs league)
             th = self.team_str.get(h, {})
             ta = self.team_str.get(a, {})
             sa_h = (th.get("strength_attack_home", self.avg_ah) / self.avg_ah) if self.avg_ah else 1.0
@@ -438,46 +489,75 @@ class ScorePredictApp(tk.Tk):
             df_h = (xga_h / (self.league_blend_xga or 1.0)) ** DEF_EXP
             df_a = (xga_a / (self.league_blend_xga or 1.0)) ** DEF_EXP
 
-            # Fixture difficulty (gentle; neutral if not found)
-            diff = self.diff_map.get((h, a))
-            if diff:
-                diff_h, diff_a = diff
-                factor_h = FD_FACTOR.get(int(diff_h), 1.0)
-                factor_a = FD_FACTOR.get(int(diff_a), 1.0)
-            else:
-                factor_h = factor_a = 1.0
-
             # Team-level goal rates (pre player layer)
             # Opponent defensive strength reduces goals: use 1/sd_*
-            lam1 = xg_h * sa_h * (1.0 / max(1e-6, sd_a)) * df_a * factor_h
-            lam2 = xg_a * sa_a * (1.0 / max(1e-6, sd_h)) * df_h * factor_a
+            lam1 = xg_h * sa_h * (1.0 / max(1e-6, sd_a)) * df_a
+            lam2 = xg_a * sa_a * (1.0 / max(1e-6, sd_h)) * df_h
+
+            # Fixture difficulty (neutral for peers; blended for others only if actual current-GW pairing)
+            factor_h = factor_a = 1.0
+            if USE_FD and not is_peer:
+                diff = self.diff_map.get((h, a))
+                if diff:
+                    raw_h = FD_RAW.get(int(diff[0]), 1.0)
+                    raw_a = FD_RAW.get(int(diff[1]), 1.0)
+                    # soften toward neutral via FD_WEIGHT
+                    factor_h = 1.0 + (raw_h - 1.0) * FD_WEIGHT
+                    factor_a = 1.0 + (raw_a - 1.0) * FD_WEIGHT
+            lam1 *= factor_h
+            lam2 *= factor_a
 
             # Player availability layer — nudge own attack only
             if USE_PLAYER_LAYER:
                 lam1 *= self.atk_mult.get(h, 1.0)
                 lam2 *= self.atk_mult.get(a, 1.0)
 
-            # Non-sum-preserving home advantage (modest)
-            lam1 *= HOME_ADV
+            # Non-sum-preserving home advantage (peer-softened)
+            lam1 *= (PEER_HOME_ADV if is_peer else HOME_ADV)
+
+            # --- Keep a snapshot of dominance BEFORE standard tilt (for mismatch decision)
+            pre_ratio = max(1e-6, lam1) / max(1e-6, lam2)
 
             # Strength ratio tilt (favourite separation), using current rates as proxy
+            eff_K   = PEER_K_TILT if is_peer else K_TILT
+            eff_CAP = PEER_TILT_CAP if is_peer else TILT_CAP
             r = max(1e-6, lam2 / max(1e-6, lam1))
             if r > 1.0:
-                tilt = min(r ** K_TILT, TILT_CAP)         # away stronger (cap applied)
+                tilt = min(r ** eff_K, eff_CAP)         # away stronger (cap applied)
                 lam2 *= tilt
                 lam1 /= tilt
             else:
-                tilt = min((1.0 / r) ** K_TILT, TILT_CAP) # home stronger (cap applied)
+                tilt = min((1.0 / r) ** eff_K, eff_CAP) # home stronger (cap applied)
                 lam1 *= tilt
                 lam2 /= tilt
 
-            # === LOCAL-MAP predicted score (3x3 around expected goals) ===
-            H_pred, A_pred, p_pred = local_map_score(lam1, lam2, rho=RHO, max_goals=MAX_GOALS)
+            # --- Extra mismatch bump (only for clear mismatches) and dynamic radius
+            dom = pre_ratio if pre_ratio >= 1.0 else (1.0 / pre_ratio)
+            radius = LOCAL_MAP_RADIUS_DEFAULT
+            thr = PEER_MISMATCH_R if is_peer else MISMATCH_R
+            cap = PEER_MISMATCH_CAP if is_peer else MISMATCH_CAP
+            if dom >= thr:
+                extra = min(dom ** MISMATCH_K, cap)
+                if pre_ratio >= 1.0:
+                    lam1 *= extra
+                    lam2 /= extra
+                else:
+                    lam2 *= extra
+                    lam1 /= extra
+                # widen search window to 5x5 only in non-peer mismatches
+                if not is_peer:
+                    radius = LOCAL_MAP_RADIUS_MISMATCH
+
+            # === LOCAL-MAP predicted score with PRIOR for selection ONLY ===
+            H_pred, A_pred, p_pred = local_map_score(lam1, lam2, rho=RHO, max_goals=MAX_GOALS, radius=radius)
             fair_odds_nv = (1.0 / p_pred) if p_pred > 0 else float('inf')
             fair_odds_ex = min_odds_for_pos_ev_on_exchange(p_pred, commission=DEFAULT_EXCH_COMM)
 
             # Most-likely match result + its probability
             res_letter, res_prob = result_probs(lam1, lam2, rho=RHO, max_goals=8)
+
+            # Debug print — helps trace why a score was chosen
+            print(f"{home} vs {away} → lam1={lam1:.2f}, lam2={lam2:.2f}, radius={radius}, score={H_pred}-{A_pred}, p={p_pred:.4f}, peer={is_peer}, FD_factors=({factor_h:.3f},{factor_a:.3f})")
 
             fixture_key = f"{home.strip()} vs {away.strip()}"  # keep user formatting for display
             tmp_rows.append({
