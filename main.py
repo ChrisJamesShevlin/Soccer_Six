@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-# Exact Score Predictor — EWMA + Priors + FPL + Softened FD + Peer Clamp + Debug
-# - FD blended (FD_WEIGHT) and disabled in peer-vs-peer (Big 6) fixtures
-# - Priors looser (selection ONLY), mismatch bump capped, home edge tuned
-# - Debug prints per fixture for tracing lambda, radius, and chosen score
+# Exact Score Predictor — EWMA + Priors + FPL + Softened FD + Peer Clamp + Clipping + Global-Mode Selection
+# Key change: score selection = GLOBAL PMF mode with a small radial penalty around (mu_h, mu_a).
+#   → No draw bias. 1–0 / 2–0 / 2–1 / 1–1 emerge only when they truly dominate the raw PMF.
+# Other features kept: FD only for actual GW pairing, peer clamp (Big 6), player layer, gentle mismatch,
+# defence scaling clamps to avoid blowouts, debug line per fixture.
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
@@ -10,18 +11,18 @@ import threading, requests, re, json, math, time
 from collections import defaultdict
 
 # =========================
-# Tunables
+# Tunables (balanced & accurate)
 # =========================
-DEF_EXP        = 0.90      # Understat xGA -> defence softness exponent
-RHO            = 0.10      # tiny correlation for low-score dependence
-MAX_GOALS      = 6
+DEF_EXP        = 0.90        # Understat xGA → defence softness exponent
+RHO            = 0.05        # small correlation (keeps 0–0/1–1 realistic but not overdone)
+MAX_GOALS      = 6           # grid cap for exact-score probabilities (0..6 each side)
 
-# Non-sum-preserving tilts (allow favourites to pull away, but gently)
-HOME_ADV       = 1.07      # stronger home advantage (~+0.25 goals on average)
-K_TILT         = 0.75      # strength-ratio exponent (higher => more asymmetry)
-TILT_CAP       = 1.55      # cap the tilt multiplier to avoid extreme separations
+# Home edge & tilt
+HOME_ADV       = 1.07
+K_TILT         = 0.70        # moderate separation
+TILT_CAP       = 1.50
 
-# Player availability layer (FPL)
+# Player availability
 USE_PLAYER_LAYER   = True
 ATK_TOP_N          = 5
 DEF_TOP_N          = 4
@@ -29,59 +30,41 @@ ATK_CLIP           = (0.80, 1.25)
 DEF_CLIP           = (0.85, 1.20)
 DEF_AVAIL_EXP      = 1.00
 
-# Promoted-team adjustment (if missing last-season EPL priors)
-PROM_ATK           = 0.90     # trim their attack baseline
-PROM_DEF           = 1.10     # worsen their conceded side
+# Promoted-team adjustment if no priors last season
+PROM_ATK           = 0.90
+PROM_DEF           = 1.10
 
-# Betting utilities
-DEFAULT_EXCH_COMM  = 0.02     # 2% exchange commission for fair-odds adj
-
-# =========================
-# Scoreline prior (selection ONLY)
-# =========================
-PRIOR_ALPHA        = 0.12     # milder margin penalty (allows 4–0/5–1 occasionally)
-PRIOR_BETA         = 0.04     # milder total-goals penalty
-PRIOR_DRAW_BONUS   = 0.05     # tiny bump to draws
-
-def _scoreline_prior_weight(H, A,
-                            alpha=PRIOR_ALPHA,
-                            beta=PRIOR_BETA,
-                            draw_bonus=PRIOR_DRAW_BONUS):
-    margin = abs(H - A)
-    total  = H + A
-    w = math.exp(-alpha * margin) * math.exp(-beta * total)
-    if H == A:
-        w *= (1.0 + draw_bonus)
-    return w
+# Betting utils
+DEFAULT_EXCH_COMM  = 0.02
 
 # =========================
-# Clear-mismatch bump (extra, capped separation in lopsided fixtures)
-# Applied after the standard ratio-tilt; decided using the pre-tilt ratio.
+# GLOBAL-MODE selection penalty (no draw bias)
 # =========================
-MISMATCH_R   = 1.60   # trigger threshold on pre-tilt lambda ratio (dominance)
-MISMATCH_K   = 0.45   # strength of extra tilt
-MISMATCH_CAP = 1.45   # hard cap for the extra tilt factor
+SEL_SIGMA          = 1.20     # Gaussian sigma in goals; soft radial penalty around (mu_h, mu_a)
+SEL_GAMMA          = 1.00     # sharpness of raw PMF (leave at 1.0; >1 sharpens)
 
-# Local map radius (for modal score selection window)
-LOCAL_MAP_RADIUS_DEFAULT  = 1   # 3x3
-LOCAL_MAP_RADIUS_MISMATCH = 2   # 5x5 when mismatch (non-peer only)
+# Mismatch bump (gentle; no window widening)
+MISMATCH_R   = 1.85
+MISMATCH_K   = 0.32
+MISMATCH_CAP = 1.28
 
-# =========================
-# Fixture difficulty controls
-# =========================
-USE_FD   = True
-FD_WEIGHT = 0.35       # 0..1: blend FD toward neutral (lower = gentler)
+# Fixture difficulty
+USE_FD     = True
+FD_WEIGHT  = 0.30            # blend FD toward neutral
 
-# Peer-vs-peer clamp (derby/elite fixtures: Big 6 vs Big 6)
+# Peer-vs-peer clamp (Big 6 vs Big 6)
 ELITE_TEAMS = {"arsenal","liverpool","man_city","man_utd","spurs","chelsea"}
-PEER_HOME_ADV     = 1.03   # soften home edge in elite vs elite
-PEER_K_TILT       = 0.65   # soften ratio tilt
-PEER_TILT_CAP     = 1.35   # cap separation more
-PEER_MISMATCH_R   = 2.20   # require MUCH bigger dominance to trigger bump
-PEER_MISMATCH_CAP = 1.25   # even if triggered, don’t let it run away
+PEER_HOME_ADV     = 1.03
+PEER_K_TILT       = 0.65
+PEER_TILT_CAP     = 1.35
+PEER_MISMATCH_R   = 2.20
+PEER_MISMATCH_CAP = 1.25
+
+# Clamp ranges for defence multipliers (FPL defence & Understat dampening)
+DEF_SCALE_MIN, DEF_SCALE_MAX = 0.88, 1.12
 
 # =========================
-# Team name normalisation (user input, FPL, Understat)
+# Team name normalisation
 # =========================
 SLUG_ALIASES = {
     # Big 6
@@ -91,7 +74,7 @@ SLUG_ALIASES = {
     "liverpool":"liverpool",
     "chelsea":"chelsea",
     "tottenham":"spurs","tottenham hotspur":"spurs","spurs":"spurs",
-    # Others in current EPL list
+    # Others
     "aston villa":"aston_villa","villa":"aston_villa",
     "brighton":"brighton","brighton & hove albion":"brighton","brighton and hove albion":"brighton",
     "bournemouth":"bournemouth","afc bournemouth":"bournemouth",
@@ -129,26 +112,27 @@ def min_odds_for_pos_ev_on_exchange(p, commission=DEFAULT_EXCH_COMM):
     if p <= 0: return float('inf')
     return 1.0 + (1.0/p - 1.0) / max(1e-6, (1.0 - commission))
 
-def local_map_score(lam1, lam2, rho=0.0, max_goals=6, radius=1):
+def global_mode_score(lam1, lam2, rho=0.0, max_goals=6, sigma=SEL_SIGMA, gamma=SEL_GAMMA):
     """
-    Pick the highest-probability score near the expected-goals centre,
-    BUT use a gentle prior ONLY for the selection step. Return the raw probability
-    of the chosen cell so fair odds/EV remain pure.
+    Global scan for the PMF mode with a *radial* penalty around (mu_h, mu_a).
+    No draw/total/margin priors. Returns (H,A,p_raw_of_cell).
     """
     lam3 = rho * min(lam1, lam2)
     mu_h, mu_a = lam1 + lam3, lam2 + lam3
-    Hc, Ac = int(round(mu_h)), int(round(mu_a))
     best = (-1.0, 0, 0, 0.0)  # (p_sel, H, A, p_raw)
-    H_lo, H_hi = max(0, Hc - radius), min(max_goals, Hc + radius)
-    A_lo, A_hi = max(0, Ac - radius), min(max_goals, Ac + radius)
-    for H in range(H_lo, H_hi + 1):
-        for A in range(A_lo, A_hi + 1):
+    two_sig2 = 2.0 * (sigma ** 2)
+    for H in range(0, max_goals + 1):
+        for A in range(0, max_goals + 1):
             p_raw = bivariate_pmf(H, A, lam1, lam2, lam3)
-            p_sel = p_raw * _scoreline_prior_weight(H, A)
+            if gamma != 1.0:
+                p_raw = p_raw ** gamma
+            dr2 = (H - mu_h) ** 2 + (A - mu_a) ** 2
+            penalty = math.exp(-dr2 / two_sig2)
+            p_sel = p_raw * penalty
             if p_sel > best[0]:
-                best = (p_sel, H, A, p_raw)
-    _, H, A, p_raw = best
-    return H, A, p_raw
+                best = (p_sel, H, A, bivariate_pmf(H, A, lam1, lam2, lam3))  # store true raw p
+    _, H, A, p_cell = best
+    return H, A, p_cell
 
 def result_probs(lam1, lam2, rho=RHO, max_goals=8):
     """Return most likely result letter and its probability."""
@@ -249,7 +233,7 @@ def build_last_season_priors(prev_season="2023"):
     return prior_xg, prior_xga, league_prior_xg, league_prior_xga
 
 # =========================
-# FPL data (strength + fixtures + players) — keyed by slug
+# FPL data (strengths + fixtures + players)
 # =========================
 def _to_float(x): 
     try: return float(x)
@@ -266,7 +250,7 @@ def _expected_minutes(p):
         if isinstance(chance, int):
             return int(90 * chance/100)
         return 30
-    return 0  # i/s/n/u
+    return 0
 
 def _per90(val, minutes):
     m = max(1, int(minutes or 0))
@@ -276,7 +260,7 @@ def build_player_availability_multipliers(elements, id2slug):
     by_team = defaultdict(list)
     for p in elements:
         p = dict(p)
-        p["team_name"] = id2slug.get(p["team"])  # store slug
+        p["team_name"] = id2slug.get(p["team"])
         if p["team_name"]:
             by_team[p["team_name"]].append(p)
     attack_mult, def_mult = {}, {}
@@ -309,11 +293,7 @@ def fetch_fpl_data(gw):
     teams    = bs["teams"]
     elements = bs["elements"]
     fixtures = requests.get(f"https://fantasy.premierleague.com/api/fixtures/?event={gw}", timeout=20).json()
-
-    # team_id -> slug (from FPL full name)
     id2slug = {t["id"]: to_slug(t["name"]) for t in teams}
-
-    # team strengths keyed by slug
     team_str = {}
     for t in teams:
         slug = id2slug[t["id"]]
@@ -323,53 +303,34 @@ def fetch_fpl_data(gw):
             "strength_defence_home": t["strength_defence_home"],
             "strength_defence_away": t["strength_defence_away"],
         }
-
     avg_ah = sum(t["strength_attack_home"] for t in teams) / len(teams)
     avg_aa = sum(t["strength_attack_away"] for t in teams) / len(teams)
-
-    # fixture difficulties keyed by (home_slug, away_slug)
     diff_map = {}
     for f in fixtures:
-        h = id2slug.get(f["team_h"])
-        a = id2slug.get(f["team_a"])
+        h = id2slug.get(f["team_h"]); a = id2slug.get(f["team_a"])
         if h and a:
             diff_map[(h, a)] = (f.get("team_h_difficulty",3), f.get("team_a_difficulty",3))
-
     atk_mult, def_mult = build_player_availability_multipliers(elements, id2slug)
     return team_str, avg_ah, avg_aa, diff_map, atk_mult, def_mult, id2slug
 
 # =========================
-# GUI App
+# GUI
 # =========================
 class ScorePredictApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Exact Score Predictor (priors + EWMA + FPL + softened FD + peer clamp)")
         self.geometry("1000x660")
-
-        # Data containers (all keyed by slug)
-        self.curr_xg = {}
-        self.curr_xga = {}
-        self.gp = {}
-        self.prior_xg = {}
-        self.prior_xga = {}
-        self.league_prior_xg = 1.2
-        self.league_prior_xga = 1.2
-        self.blend_xg = {}
-        self.blend_xga = {}
+        self.curr_xg = {}; self.curr_xga = {}; self.gp = {}
+        self.prior_xg = {}; self.prior_xga = {}
+        self.league_prior_xg = 1.2; self.league_prior_xga = 1.2
+        self.blend_xg = {}; self.blend_xga = {}
         self.league_blend_xga = 1.0
-
-        self.team_str = {}
-        self.avg_ah = self.avg_aa = 50.0
-        self.diff_map = {}
-        self.atk_mult = defaultdict(lambda: 1.0)
+        self.team_str = {}; self.avg_ah = self.avg_aa = 50.0
+        self.diff_map = {}; self.atk_mult = defaultdict(lambda: 1.0)
         self.def_mult = defaultdict(lambda: 1.0)
-        self.avg_dh = 50.0
-        self.avg_da = 50.0
-        self.id2slug = {}
-        self.gw_loaded = None
-
-        # rows cache: item_id -> dict
+        self.avg_dh = 50.0; self.avg_da = 50.0
+        self.id2slug = {}; self.gw_loaded = None
         self.rows = {}
         self._build_ui()
         threading.Thread(target=self._load_data, daemon=True).start()
@@ -378,48 +339,35 @@ class ScorePredictApp(tk.Tk):
         frm = ttk.Frame(self); frm.pack(fill=tk.X, padx=10, pady=10)
         ttk.Label(frm, text="Fixtures (one per line, e.g. 'Liverpool vs Arsenal'). Double-click a 'Market Odds' cell to enter a price.").pack(anchor=tk.W)
         self.text = tk.Text(frm, height=6); self.text.pack(fill=tk.X)
-
         btnrow = ttk.Frame(frm); btnrow.pack(pady=6)
         ttk.Button(btnrow, text="Predict & Rank", command=self.on_predict).pack(side=tk.LEFT, padx=4)
         ttk.Button(btnrow, text="Check Data",   command=self.on_check_data).pack(side=tk.LEFT, padx=4)
-
-        # Columns include Result and Result %
-        cols = ["Fixture", "Predicted Score", "Result", "Result %", "Model Prob %", "Fair Odds", "Fair O (exch 2%)", "Market Odds", "Edge %", "EV/£"]
+        cols = ["Fixture","Predicted Score","Result","Result %","Model Prob %","Fair Odds","Fair O (exch 2%)","Market Odds","Edge %","EV/£"]
         self.cols = cols
         self.tree = ttk.Treeview(self, columns=cols, show="headings", height=16)
-        for c, w in zip(cols, [220, 140, 60, 80, 100, 100, 120, 100, 90, 80]):
+        for c, w in zip(cols, [220,140,60,80,100,100,120,100,90,80]):
             self.tree.heading(c, text=c)
             self.tree.column(c, anchor=tk.CENTER, width=w)
         self.tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
-
         self.tree.bind("<Double-1>", self.on_tree_double_click)
-
         self.status = tk.StringVar(value="⏳ Loading data…")
         ttk.Label(self, textvariable=self.status).pack(anchor=tk.W, padx=10)
 
-    # ── Data loading
     def _load_data(self):
         try:
             bs = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=20).json()
             evs = bs["events"]
             gw  = next((e["id"] for e in evs if e.get("is_current")), evs[0]["id"])
             self.gw_loaded = gw
-
             (self.team_str, self.avg_ah, self.avg_aa,
              self.diff_map, self.atk_mult, self.def_mult, self.id2slug) = fetch_fpl_data(gw)
-
-            # Defensive league averages for normalization
             dh_vals = [t["strength_defence_home"] for t in self.team_str.values() if "strength_defence_home" in t]
             da_vals = [t["strength_defence_away"] for t in self.team_str.values() if "strength_defence_away" in t]
             self.avg_dh = sum(dh_vals)/len(dh_vals) if dh_vals else 50.0
             self.avg_da = sum(da_vals)/len(da_vals) if da_vals else 50.0
-
-            # Understat trends (slugs applied inside)
             self.curr_xg, self.curr_xga, self.gp = build_current_ewma(season="2024", span=8)
             (self.prior_xg, self.prior_xga,
              self.league_prior_xg, self.league_prior_xga) = build_last_season_priors(prev_season="2023")
-
-            # Blend priors toward current EWMA based on games played
             all_teams = set(self.curr_xg) | set(self.prior_xg) | set(self.team_str.keys())
             for t in all_teams:
                 gp_t = self.gp.get(t, 0)
@@ -430,37 +378,27 @@ class ScorePredictApp(tk.Tk):
                 cxga = self.curr_xga.get(t, pxga)
                 self.blend_xg[t]  = w * cxg  + (1 - w) * pxg
                 self.blend_xga[t] = w * cxga + (1 - w) * pxga
-
             self.league_blend_xga = sum(self.blend_xga.values()) / max(1, len(self.blend_xga))
             self.status.set("✅ Data loaded. Enter fixtures, then double-click 'Market Odds' to price.")
         except Exception as e:
             self.status.set(f"❌ Load error: {e}")
 
-    # ── Prediction
     def on_predict(self):
         if not self.blend_xg:
             messagebox.showwarning("Please wait", "Data still loading…")
             return
-
-        # preserve any already-entered odds by fixture key
-        prev_odds = {}
-        for iid, r in self.rows.items():
-            prev_odds[r["Fixture"]] = r.get("Odds")
-
+        prev_odds = {r["Fixture"]: r.get("Odds") for r in self.rows.values()}
         self.tree.delete(*self.tree.get_children())
         self.rows.clear()
-
         lines = [l.strip() for l in self.text.get("1.0", tk.END).splitlines() if l.strip()]
         tmp_rows = []
-
-        # FD raw map (we'll blend with FD_WEIGHT; peer fixtures neutral)
         FD_RAW = {1: 1.10, 2: 1.05, 3: 1.00, 4: 0.95, 5: 0.90}
 
         for line in lines:
-            if "vs" not in line: 
+            if "vs" not in line:
                 continue
             home, away = [s.strip() for s in line.split("vs", 1)]
-            h, a = to_slug(home), to_slug(away)   # canonical slugs
+            h, a = to_slug(home), to_slug(away)
             is_peer = (h in ELITE_TEAMS) and (a in ELITE_TEAMS)
 
             # xG/xGA baselines (blended)
@@ -477,7 +415,7 @@ class ScorePredictApp(tk.Tk):
                 xg_a  *= PROM_ATK
                 xga_a *= PROM_DEF
 
-            # FPL strengths (attack & DEFENCE normalized vs league)
+            # FPL strengths (attack & defence vs league)
             th = self.team_str.get(h, {})
             ta = self.team_str.get(a, {})
             sa_h = (th.get("strength_attack_home", self.avg_ah) / self.avg_ah) if self.avg_ah else 1.0
@@ -485,93 +423,87 @@ class ScorePredictApp(tk.Tk):
             sd_h = (th.get("strength_defence_home", self.avg_dh) / self.avg_dh) if self.avg_dh else 1.0
             sd_a = (ta.get("strength_defence_away", self.avg_da) / self.avg_da) if self.avg_da else 1.0
 
-            # Understat defence dampening vs league
+            # Clamp FPL defence ratios
+            sd_h = max(DEF_SCALE_MIN, min(DEF_SCALE_MAX, sd_h))
+            sd_a = max(DEF_SCALE_MIN, min(DEF_SCALE_MAX, sd_a))
+
+            # Understat defence dampening (then clamp)
             df_h = (xga_h / (self.league_blend_xga or 1.0)) ** DEF_EXP
             df_a = (xga_a / (self.league_blend_xga or 1.0)) ** DEF_EXP
+            df_h = max(DEF_SCALE_MIN, min(DEF_SCALE_MAX, df_h))
+            df_a = max(DEF_SCALE_MIN, min(DEF_SCALE_MAX, df_a))
 
             # Team-level goal rates (pre player layer)
-            # Opponent defensive strength reduces goals: use 1/sd_*
             lam1 = xg_h * sa_h * (1.0 / max(1e-6, sd_a)) * df_a
             lam2 = xg_a * sa_a * (1.0 / max(1e-6, sd_h)) * df_h
 
-            # Fixture difficulty (neutral for peers; blended for others only if actual current-GW pairing)
+            # Fixture difficulty (only for actual GW pairing; neutral for peers)
             factor_h = factor_a = 1.0
             if USE_FD and not is_peer:
                 diff = self.diff_map.get((h, a))
                 if diff:
                     raw_h = FD_RAW.get(int(diff[0]), 1.0)
                     raw_a = FD_RAW.get(int(diff[1]), 1.0)
-                    # soften toward neutral via FD_WEIGHT
                     factor_h = 1.0 + (raw_h - 1.0) * FD_WEIGHT
                     factor_a = 1.0 + (raw_a - 1.0) * FD_WEIGHT
             lam1 *= factor_h
             lam2 *= factor_a
 
-            # Player availability layer — nudge own attack only
+            # Player availability nudges own attack
             if USE_PLAYER_LAYER:
                 lam1 *= self.atk_mult.get(h, 1.0)
                 lam2 *= self.atk_mult.get(a, 1.0)
 
-            # Non-sum-preserving home advantage (peer-softened)
+            # Home advantage (peer softened)
             lam1 *= (PEER_HOME_ADV if is_peer else HOME_ADV)
 
-            # --- Keep a snapshot of dominance BEFORE standard tilt (for mismatch decision)
+            # Snapshot dominance BEFORE standard tilt
             pre_ratio = max(1e-6, lam1) / max(1e-6, lam2)
 
-            # Strength ratio tilt (favourite separation), using current rates as proxy
+            # Standard ratio tilt
             eff_K   = PEER_K_TILT if is_peer else K_TILT
             eff_CAP = PEER_TILT_CAP if is_peer else TILT_CAP
             r = max(1e-6, lam2 / max(1e-6, lam1))
             if r > 1.0:
-                tilt = min(r ** eff_K, eff_CAP)         # away stronger (cap applied)
-                lam2 *= tilt
-                lam1 /= tilt
+                tilt = min(r ** eff_K, eff_CAP); lam2 *= tilt; lam1 /= tilt
             else:
-                tilt = min((1.0 / r) ** eff_K, eff_CAP) # home stronger (cap applied)
-                lam1 *= tilt
-                lam2 /= tilt
+                tilt = min((1.0 / r) ** eff_K, eff_CAP); lam1 *= tilt; lam2 /= tilt
 
-            # --- Extra mismatch bump (only for clear mismatches) and dynamic radius
+            # Extra mismatch bump (gentle)
             dom = pre_ratio if pre_ratio >= 1.0 else (1.0 / pre_ratio)
-            radius = LOCAL_MAP_RADIUS_DEFAULT
             thr = PEER_MISMATCH_R if is_peer else MISMATCH_R
             cap = PEER_MISMATCH_CAP if is_peer else MISMATCH_CAP
             if dom >= thr:
                 extra = min(dom ** MISMATCH_K, cap)
                 if pre_ratio >= 1.0:
-                    lam1 *= extra
-                    lam2 /= extra
+                    lam1 *= extra; lam2 /= extra
                 else:
-                    lam2 *= extra
-                    lam1 /= extra
-                # widen search window to 5x5 only in non-peer mismatches
-                if not is_peer:
-                    radius = LOCAL_MAP_RADIUS_MISMATCH
+                    lam2 *= extra; lam1 /= extra
 
-            # === LOCAL-MAP predicted score with PRIOR for selection ONLY ===
-            H_pred, A_pred, p_pred = local_map_score(lam1, lam2, rho=RHO, max_goals=MAX_GOALS, radius=radius)
+            # === GLOBAL-MODE exact score (radial penalty only; no draw/total priors) ===
+            H_pred, A_pred, p_pred = global_mode_score(lam1, lam2, rho=RHO, max_goals=MAX_GOALS)
             fair_odds_nv = (1.0 / p_pred) if p_pred > 0 else float('inf')
             fair_odds_ex = min_odds_for_pos_ev_on_exchange(p_pred, commission=DEFAULT_EXCH_COMM)
 
-            # Most-likely match result + its probability
+            # Most-likely 1X2 result
             res_letter, res_prob = result_probs(lam1, lam2, rho=RHO, max_goals=8)
 
-            # Debug print — helps trace why a score was chosen
-            print(f"{home} vs {away} → lam1={lam1:.2f}, lam2={lam2:.2f}, radius={radius}, score={H_pred}-{A_pred}, p={p_pred:.4f}, peer={is_peer}, FD_factors=({factor_h:.3f},{factor_a:.3f})")
+            # Debug line
+            print(f"{home} vs {away} → lam1={lam1:.2f}, lam2={lam2:.2f}, score={H_pred}-{A_pred}, p={p_pred:.4f}, peer={is_peer}, FD=({factor_h:.3f},{factor_a:.3f})")
 
-            fixture_key = f"{home.strip()} vs {away.strip()}"  # keep user formatting for display
+            fixture_key = f"{home.strip()} vs {away.strip()}"
             tmp_rows.append({
                 "Fixture": fixture_key,
                 "Pred": f"{H_pred} - {A_pred}",
                 "Res": res_letter,
-                "ResPct": res_prob,   # store as 0–1
+                "ResPct": res_prob,
                 "Prob": p_pred,
                 "Fair": fair_odds_nv,
                 "FairEx": fair_odds_ex,
                 "Odds": prev_odds.get(fixture_key)
             })
 
-        # default sort by Prob desc (until odds entered)
+        # Sort by model prob until odds entered
         tmp_rows.sort(key=lambda r: r["Prob"], reverse=True)
 
         for r in tmp_rows:
@@ -588,9 +520,7 @@ class ScorePredictApp(tk.Tk):
             iid = self.tree.insert(
                 "", tk.END,
                 values=(
-                    r["Fixture"],
-                    r["Pred"],
-                    r["Res"],
+                    r["Fixture"], r["Pred"], r["Res"],
                     f"{r['ResPct']*100:.1f}",
                     f"{r['Prob']*100:.1f}",
                     f"{r['Fair']:.2f}",
@@ -602,82 +532,57 @@ class ScorePredictApp(tk.Tk):
             )
             self.rows[iid] = r
 
-    # ── Editing odds in-table
     def on_tree_double_click(self, event):
         region = self.tree.identify_region(event.x, event.y)
-        if region != "cell":
-            return
-        column = self.tree.identify_column(event.x)  # '#1', '#2', ...
+        if region != "cell": return
+        column = self.tree.identify_column(event.x)
         col_index = int(column.replace("#", "")) - 1
         col_name = self.cols[col_index]
-        if col_name != "Market Odds":
-            return
-
+        if col_name != "Market Odds": return
         iid = self.tree.identify_row(event.y)
-        if not iid:
-            return
+        if not iid: return
         r = self.rows.get(iid)
-        if not r:
-            return
-
-        # Ask for odds
+        if not r: return
         cur = "" if not r.get("Odds") else str(r["Odds"])
         ans = simpledialog.askstring("Market Odds", f"Enter decimal odds for:\n{r['Fixture']}  [{r['Pred']}]", initialvalue=cur, parent=self)
-        if ans is None:
-            return
+        if ans is None: return
         try:
             odds = float(ans)
-            if odds <= 1.0:
-                raise ValueError
+            if odds <= 1.0: raise ValueError
         except Exception:
             messagebox.showerror("Invalid odds", "Please enter decimal odds > 1.0.")
             return
-
         r["Odds"] = odds
-        # recompute edge + EV
         imp = 1.0 / odds
         edge_pct = (r["Prob"] - imp) * 100.0
         ev = r["Prob"] * (odds - 1.0) - (1.0 - r["Prob"])
-
-        # update row display (use column names so indexes stay correct)
         vals = list(self.tree.item(iid, "values"))
         vals[self.cols.index("Market Odds")] = f"{odds:.2f}"
         vals[self.cols.index("Edge %")]      = f"{edge_pct:.1f}%"
         vals[self.cols.index("EV/£")]        = f"{ev:.3f}"
         self.tree.item(iid, values=tuple(vals))
-
-        # resort: rows with odds -> sort by Edge desc; else keep by Prob
         self._resort()
 
     def _resort(self):
-        # pull all rows into list with numeric sort keys
         entries = []
         for iid, r in self.rows.items():
             edge = None
             if r.get("Odds"):
-                try:
-                    edge = (r["Prob"] - 1.0 / float(r["Odds"])) * 100.0
-                except Exception:
-                    edge = None
+                try: edge = (r["Prob"] - 1.0 / float(r["Odds"])) * 100.0
+                except Exception: edge = None
             entries.append((iid, r, edge))
-
-        if any(e is not None for _, _, e in entries):
-            # sort by Edge desc; rows without odds sink
+        if any(e is not None for _,_,e in entries):
             entries.sort(key=lambda x: (-1e-9 if x[2] is None else x[2]), reverse=True)
         else:
             entries.sort(key=lambda x: x[1]["Prob"], reverse=True)
-
-        # reinsert in new order
         for iid, _, _ in entries:
             self.tree.move(iid, "", "end")
 
-    # ── Data check popup (pings FPL + Understat)
     def on_check_data(self):
         def _run():
             lines = []
             cur = None
             events = []
-            # FPL bootstrap
             try:
                 r = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=20)
                 r.raise_for_status()
@@ -694,8 +599,6 @@ class ScorePredictApp(tk.Tk):
                     lines.append(f"  Next    GW: {nxt['id']}  deadline: {nxt.get('deadline_time','?')}")
             except Exception as e:
                 lines.append(f"FPL bootstrap: ERROR → {e}")
-
-            # FPL fixtures for loaded GW (or current if missing)
             try:
                 gw = self.gw_loaded if self.gw_loaded is not None else (cur["id"] if cur else (events[0]["id"] if events else 1))
                 rf = requests.get(f"https://fantasy.premierleague.com/api/fixtures/?event={gw}", timeout=20)
@@ -704,8 +607,6 @@ class ScorePredictApp(tk.Tk):
                 lines.append(f"FPL fixtures (GW {gw}): OK (fixtures {len(fixtures)})")
             except Exception as e:
                 lines.append(f"FPL fixtures: ERROR → {e}")
-
-            # Understat EPL season page
             try:
                 url = "https://understat.com/league/EPL/2024"
                 html = requests.get(url, headers={"User-Agent":"Mozilla/5.0","Accept":"text/html,application/xhtml+xml"}, timeout=20).text
@@ -723,7 +624,6 @@ class ScorePredictApp(tk.Tk):
                 lines.append(f"Understat: OK (matches {n}, teams {len(teams)}, last date {last_date or 'n/a'})")
             except Exception as e:
                 lines.append(f"Understat: ERROR → {e}")
-
             msg = "\n".join(lines)
             self.after(0, lambda: messagebox.showinfo("Data Check", msg, parent=self))
         threading.Thread(target=_run, daemon=True).start()
