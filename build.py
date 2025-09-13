@@ -35,6 +35,9 @@ PROM_DEF           = 1.10
 DEFAULT_EXCH_COMM  = 0.02
 FLAT_STAKE_BUILDER = 0.25   # your flat per-match stake
 
+# When no market odds are given, show top-K builders per match
+TOP_K_BUILDERS_NO_ODDS = 1
+
 # =========================
 # GLOBAL-MODE selection penalty (no draw bias)
 # =========================
@@ -142,7 +145,7 @@ def result_probs(lam1, lam2, rho=RHO, max_goals=8):
     if pA >= pH and pA >= pD: return "A", pA
     return "D", pD
 
-# === Builder predicates on the grid ===
+# === Grid helpers for builders ===
 def grid_prob(lam1, lam2, rho, pred, max_goals=MAX_GOALS):
     lam3 = rho * min(lam1, lam2)
     tot = 0.0
@@ -154,15 +157,22 @@ def grid_prob(lam1, lam2, rho, pred, max_goals=MAX_GOALS):
 
 def p_btts(l1,l2,r): return grid_prob(l1,l2,r, lambda H,A: H>=1 and A>=1)
 
-# Builder recipes: name -> function(l1,l2,rho)->prob
+# Builder recipes: (name, fn(l1,l2,rho)->prob)
 BUILDER_RECIPES = [
+    # Overs
     ("Home & Over 2.5", lambda l1,l2,r: grid_prob(l1,l2,r, lambda H,A: (H>A) and (H+A>=3))),
     ("Away & Over 2.5", lambda l1,l2,r: grid_prob(l1,l2,r, lambda H,A: (A>H) and (H+A>=3))),
     ("Home & BTTS",     lambda l1,l2,r: grid_prob(l1,l2,r, lambda H,A: (H>A) and (H>=1 and A>=1))),
     ("Away & BTTS",     lambda l1,l2,r: grid_prob(l1,l2,r, lambda H,A: (A>H) and (H>=1 and A>=1))),
+    ("BTTS & Over 2.5", lambda l1,l2,r: grid_prob(l1,l2,r, lambda H,A: (H>=1 and A>=1) and (H+A>=3))),
+    # Draw unders
     ("Draw & Under 3.5",lambda l1,l2,r: grid_prob(l1,l2,r, lambda H,A: (H==A) and (H+A<=3))),
     ("Draw & Under 2.5",lambda l1,l2,r: grid_prob(l1,l2,r, lambda H,A: (H==A) and (H+A<=2))),
-    ("BTTS & Over 2.5", lambda l1,l2,r: grid_prob(l1,l2,r, lambda H,A: (H>=1 and A>=1) and (H+A>=3))),
+    # NEW: Under variants to avoid bias to overs
+    ("Home & Under 3.5",lambda l1,l2,r: grid_prob(l1,l2,r, lambda H,A: (H>A) and (H+A<=3))),
+    ("Home & Under 2.5",lambda l1,l2,r: grid_prob(l1,l2,r, lambda H,A: (H>A) and (H+A<=2))),
+    ("Away & Under 3.5",lambda l1,l2,r: grid_prob(l1,l2,r, lambda H,A: (A>H) and (H+A<=3))),
+    ("Away & Under 2.5",lambda l1,l2,r: grid_prob(l1,l2,r, lambda H,A: (A>H) and (H+A<=2))),
 ]
 
 # =========================
@@ -354,7 +364,7 @@ class ScorePredictApp(tk.Tk):
         cols = ["Fixture","Predicted Score","Result","Result %","Model Prob %","Fair Odds","Fair O (exch 2%)","Market Odds","Edge %","EV/£"]
         self.cols = cols
         self.tree = ttk.Treeview(tab1, columns=cols, show="headings", height=16)
-        for c, w in zip(cols, [240,140,60,80,100,100,130,100,90,80]):
+        for c, w in zip(cols, [240,140,60,80,100,100,130,110,80,80]):
             self.tree.heading(c, text=c); self.tree.column(c, anchor=tk.CENTER, width=w)
         self.tree.pack(fill=tk.BOTH, expand=True)
         self.tree.bind("<Double-1>", self.on_tree_double_click)
@@ -364,7 +374,7 @@ class ScorePredictApp(tk.Tk):
         bcols = ["Fixture","Suggested Builder","Fair Prob %","Fair Odds","Min Exch Odds","Market Odds (Builder)","Edge %","EV @ £0.25"]
         self.bcols = bcols
         self.btree = ttk.Treeview(tab2, columns=bcols, show="headings", height=16)
-        for c, w in zip(bcols, [280,300,90,90,110,140,80,90]):
+        for c, w in zip(bcols, [280,300,90,90,110,160,90,100]):
             self.btree.heading(c, text=c); self.btree.column(c, anchor=tk.CENTER, width=w)
         self.btree.pack(fill=tk.BOTH, expand=True)
         self.btree.bind("<Double-1>", self.on_builder_double_click)
@@ -472,7 +482,7 @@ class ScorePredictApp(tk.Tk):
 
         lines = [l.strip() for l in self.text.get("1.0", tk.END).splitlines() if l.strip()]
         tmp_rows = []
-        tmp_builders = []
+        tmp_builders_map = defaultdict(list)
 
         for line in lines:
             if "vs" not in line: continue
@@ -498,20 +508,18 @@ class ScorePredictApp(tk.Tk):
             })
 
             # === Bet Builder evaluation ===
-            best = None
+            cand_rows = []
             for name, fn in BUILDER_RECIPES:
                 p = max(0.0, min(1.0, fn(lam1, lam2, RHO)))
                 fair = (1.0 / p) if p > 0 else float('inf')
                 min_ex = min_odds_for_pos_ev_on_exchange(p, DEFAULT_EXCH_COMM)
-                # recall previously entered market odds for this specific recipe
                 mkt_prev = prev_builder.get((fixture_key, name))
                 try:
                     mkt_odds = float(mkt_prev) if (mkt_prev is not None) else None
                 except Exception:
                     mkt_odds = None
-                # choose score: EV/£ if odds present, else probability
                 score = (p * (mkt_odds - 1.0) - (1.0 - p)) if (mkt_odds is not None) else p
-                row = {
+                cand_rows.append({
                     "Fixture": fixture_key,
                     "Builder": name,
                     "p": p,
@@ -520,11 +528,11 @@ class ScorePredictApp(tk.Tk):
                     "MktOdds": mkt_odds,
                     "NameKey": name,
                     "score": score,
-                }
-                if (best is None) or (score > best["score"]):
-                    best = row
-            if best is not None:
-                tmp_builders.append(best)
+                })
+            # pick top-K by score (probability when no odds)
+            cand_rows.sort(key=lambda r: r["score"], reverse=True)
+            topk = cand_rows[:max(1, TOP_K_BUILDERS_NO_ODDS)]
+            tmp_builders_map[fixture_key].extend(topk)
 
         # Sort exact-score rows by model prob
         tmp_rows.sort(key=lambda r: r["Prob"], reverse=True)
@@ -543,25 +551,28 @@ class ScorePredictApp(tk.Tk):
             ))
             self.rows[iid] = r
 
-        # Sort builder rows by fair probability initially
-        tmp_builders.sort(key=lambda r: r["p"], reverse=True)
-        for r in tmp_builders:
-            mkt = r.get("MktOdds")
-            edge_str = ev25_str = mkt_str = ""
-            if mkt is not None:
-                p = r["p"]; odds = float(mkt)
-                edge_pct = ((p * odds) - 1.0) * 100.0  # overlay-ish
-                ev_per_1 = p * (odds - 1.0) - (1.0 - p)
-                ev25 = ev_per_1 * FLAT_STAKE_BUILDER
-                edge_str = f"{edge_pct:.1f}%"
-                ev25_str = f"{ev25:.2f}"
-                mkt_str = f"{odds:.2f}"
-            iid = self.btree.insert("", tk.END, values=(
-                r["Fixture"], r["Builder"],
-                f"{r['p']*100:.1f}", f"{r['Fair']:.2f}", f"{r['MinEx']:.2f}",
-                mkt_str, edge_str, ev25_str
-            ))
-            self.builder_rows[iid] = r
+        # Insert builder rows (top-K per fixture)
+        for fixture_key, rows in tmp_builders_map.items():
+            # sort by prob if no market odds present among top-K
+            if not any(r.get("MktOdds") is not None for r in rows):
+                rows.sort(key=lambda r: r["p"], reverse=True)
+            for r in rows:
+                mkt = r.get("MktOdds")
+                edge_str = ev25_str = mkt_str = ""
+                if mkt is not None:
+                    p = r["p"]; odds = float(mkt)
+                    edge_pct = ((p * odds) - 1.0) * 100.0  # overlay-ish
+                    ev_per_1 = p * (odds - 1.0) - (1.0 - p)
+                    ev25 = ev_per_1 * FLAT_STAKE_BUILDER
+                    edge_str = f"{edge_pct:.1f}%"
+                    ev25_str = f"{ev25:.2f}"
+                    mkt_str = f"{odds:.2f}"
+                iid = self.btree.insert("", tk.END, values=(
+                    r["Fixture"], r["Builder"],
+                    f"{r['p']*100:.1f}", f"{r['Fair']:.2f}", f"{r['MinEx']:.2f}",
+                    mkt_str, edge_str, ev25_str
+                ))
+                self.builder_rows[iid] = r
 
     # === Exact-score odds editing ===
     def on_tree_double_click(self, event):
