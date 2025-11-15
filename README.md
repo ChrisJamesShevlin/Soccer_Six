@@ -1,8 +1,4 @@
-Here is a full **GitHub-ready README.md** for your *Exact Score Predictor + Bet Builder* model — **clean**, **structured**, **technical**, and **without any screenshot section**.
 
-If you want a shorter version, a more visual version, or badges added at the top, just say.
-
----
 
 # **Exact Score Predictor — EWMA + Priors + FD + Bivariate Poisson + Bet Builder Engine**
 
@@ -212,15 +208,4 @@ README.md
 
 ---
 
-## 🧩 If You Want More
 
-I can add any of the following:
-
-* CSV export
-* Logging of fixture predictions
-* Live scraping of bookmaker odds
-* Heatmaps for exact score grids
-* Integration with your FPL team model
-* A dark-mode Tkinter theme (fits your preference)
-
-Just tell me and I’ll extend it.
